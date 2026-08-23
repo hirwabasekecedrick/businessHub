@@ -13,6 +13,7 @@ async function bootstrap() {
   app.enableCors({
     origin: process.env.FRONTEND_URL?.split(',') ?? ['http://localhost:3000', 'http://localhost:3001'],
     credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-organization-id'],
   });
   // Controllers already carry the /v1 prefix; no global prefix needed.
   await app.listen(process.env.PORT ?? 2020);
