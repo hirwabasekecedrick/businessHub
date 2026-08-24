@@ -130,7 +130,7 @@ export default function FeaturesPage() {
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between px-6 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
             <Landmark className="size-3.5" />
-            BusinessHub · Afrisoft
+            BusinessHub
           </span>
           <span>© {new Date().getFullYear()} All rights reserved.</span>
         </div>

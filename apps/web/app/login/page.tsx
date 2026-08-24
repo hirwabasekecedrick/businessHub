@@ -211,7 +211,7 @@ export default function LoginPage() {
           </p>
         </div>
         <p className="relative z-10 text-xs text-white/70">
-          Â© {new Date().getFullYear()} Afrisoft Â· BusinessHub
+          ©{new Date().getFullYear()} BusinessHub
         </p>
       </aside>
 
