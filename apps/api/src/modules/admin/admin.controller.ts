@@ -60,8 +60,48 @@ export class AdminController {
     });
   }
 
-  /** US-9.1: export runs as a Job; result carries the CSV payload. */
-  @Post('admin/audit/export')
+  /**
+   * FR-9.5: proves the audit trail is append-only at the database level.
+   * Attempts an UPDATE and a DELETE against the newest audit row — both must be
+   * rejected by the audit_event_append_only trigger regardless of role grants.
+   */
+  @Post('admin/audit/append-only-check')
+  @HttpCode(200)
+  async appendOnlyCheck(@CurrentUser() ctx: UserContext) {
+    this.requirePermission(ctx, 'admin.audit.read');
+    const newest = await this.prisma.auditEvent.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+    if (!newest) return { enforced: true, reason: 'NO_ROWS' };
+    const results: Record<string, boolean> = {};
+    for (const op of ['update', 'delete'] as const) {
+      try {
+        if (op === 'update') {
+          await this.prisma.auditEvent.update({
+            where: { id: newest.id },
+            data: { outcome: 'TAMPERED' },
+          });
+        } else {
+          await this.prisma.auditEvent.delete({ where: { id: newest.id } });
+        }
+        results[op] = false; // mutation went through — enforcement is broken
+      } catch {
+        results[op] = true; // rejected by the database
+      }
+    }
+    const stillThere = await this.prisma.auditEvent.findUnique({ where: { id: newest.id }, select: { id: true, outcome: true } });
+    await this.audit.record({
+      actorUserId: ctx.id,
+      action: 'AUDIT_APPEND_ONLY_CHECK',
+      resourceType: 'audit_event',
+      resourceId: String(newest.id),
+      after: results,
+    });
+    return {
+      enforced: results.update && results.delete && stillThere?.outcome !== 'TAMPERED',
+      operations: results,
+    };
+  }
+
+  /** US-9.1: export runs as a Job; result carries the CSV payload. */  @Post('admin/audit/export')
   async exportAudit(@CurrentUser() ctx: UserContext, @Body() body: any) {
     this.requirePermission(ctx, 'admin.audit.read');
     const events = await this.prisma.auditEvent.findMany({
@@ -200,6 +240,183 @@ export class AdminController {
       outcome: 'SUCCESS',
     });
     return result;
+  }
+
+  // ---------- ORGANISATION SETTINGS (FR-9.2) ----------
+
+  @Get('admin/settings')
+  async getSettings(@CurrentUser() ctx: UserContext) {
+    this.requirePermission(ctx, 'org.settings.manage');
+    const org = await this.prisma.organization.findUnique({ where: { id: ctx.organizationId! } });
+    if (!org) throw new NotFoundException({ code: 'ORG_NOT_FOUND' });
+    return {
+      organizationId: org.id,
+      settings: {
+        branding: {},
+        locale: 'en',
+        currency: 'EUR',
+        invoiceNumbering: 'INV-YYYY-NNNNN',
+        dunningScheduleDays: [7, 14, 30],
+        ...((org.settings as Record<string, unknown>) ?? {}),
+      },
+    };
+  }
+
+  @Put('admin/settings')
+  async putSettings(@CurrentUser() ctx: UserContext, @Body() body: any) {
+    this.requirePermission(ctx, 'org.settings.manage');
+    const org = await this.prisma.organization.findUnique({ where: { id: ctx.organizationId! } });
+    if (!org) throw new NotFoundException({ code: 'ORG_NOT_FOUND' });
+    const merged = { ...((org.settings as Record<string, unknown>) ?? {}), ...(body ?? {}) };
+    if (body?.currency && !/^[A-Z]{3}$/.test(body.currency)) {
+      throw new UnprocessableEntityException({ code: 'VALIDATION_FAILED', rule: 'currency_iso_4217' });
+    }
+    if (body?.dunningScheduleDays && (!Array.isArray(body.dunningScheduleDays) || body.dunningScheduleDays.some((d: any) => !Number.isInteger(d) || d < 1))) {
+      throw new UnprocessableEntityException({ code: 'VALIDATION_FAILED', rule: 'dunning_days' });
+    }
+    await this.prisma.organization.update({ where: { id: org.id }, data: { settings: merged } });
+    await this.audit.record({
+      actorUserId: ctx.id,
+      organizationId: ctx.organizationId,
+      action: 'org.settings_changed',
+      resourceType: 'organization',
+      resourceId: org.id,
+      before: org.settings as any,
+      after: merged,
+    });
+    return { organizationId: org.id, settings: merged };
+  }
+
+  // ---------- REFERENCE DATA (FR-9.1) ----------
+
+  private static readonly REFERENCE_DEFAULTS: Record<string, unknown[]> = {
+    'tax-rates': [{ name: 'Standard', rate: 18 }, { name: 'Zero', rate: 0 }],
+    'business-calendars': [
+      { name: 'Main', workingDays: [1, 2, 3, 4, 5], workStart: '08:00', workEnd: '17:00', holidays: [] },
+    ],
+    'document-categories': ['incorporation_certificate', 'tax_clearance', 'contract'],
+    priorities: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'],
+  };
+
+  @Get('admin/reference/:set')
+  async getReferenceSet(@CurrentUser() ctx: UserContext, @Param('set') set: string) {
+    this.requirePermission(ctx, 'admin.reference.manage');
+    if (!AdminController.REFERENCE_DEFAULTS[set]) {
+      throw new NotFoundException({ code: 'REFERENCE_SET_NOT_FOUND', set });
+    }
+    const row = await this.prisma.referenceSet.findUnique({
+      where: { organizationId_set: { organizationId: ctx.organizationId!, set } },
+    });
+    return { set, items: (row?.items as unknown[]) ?? AdminController.REFERENCE_DEFAULTS[set], customized: !!row, updatedAt: row?.updatedAt ?? null };
+  }
+
+  @Put('admin/reference/:set')
+  async putReferenceSet(@CurrentUser() ctx: UserContext, @Param('set') set: string, @Body() body: any) {
+    this.requirePermission(ctx, 'admin.reference.manage');
+    if (!AdminController.REFERENCE_DEFAULTS[set]) {
+      throw new NotFoundException({ code: 'REFERENCE_SET_NOT_FOUND', set });
+    }
+    if (!Array.isArray(body?.items)) {
+      throw new UnprocessableEntityException({ code: 'VALIDATION_FAILED', rule: 'items_array_required' });
+    }
+    const saved = await this.prisma.referenceSet.upsert({
+      where: { organizationId_set: { organizationId: ctx.organizationId!, set } },
+      update: { items: body.items, updatedById: ctx.id },
+      create: { organizationId: ctx.organizationId!, set, items: body.items, updatedById: ctx.id },
+    });
+    await this.audit.record({
+      actorUserId: ctx.id,
+      organizationId: ctx.organizationId,
+      action: 'admin.reference_changed',
+      resourceType: 'reference_set',
+      resourceId: saved.id,
+      after: { set, count: body.items.length },
+    });
+    return { set, items: saved.items as unknown[], updatedAt: saved.updatedAt };
+  }
+
+  // ---------- FEATURE FLAGS & MAINTENANCE MODE (FR-9.5) ----------
+
+  private static readonly FLAG_DEFAULTS = {
+    featureFlags: {
+      onlinePayments: true,
+      publicIntake: true,
+      partnerPortal: false,
+    } as Record<string, boolean>,
+    maintenance: { enabled: false, message: null as string | null },
+  };
+
+  @Get('admin/flags')
+  async getFlags(@CurrentUser() ctx: UserContext) {
+    this.requirePermission(ctx, 'org.settings.manage');
+    const org = await this.prisma.organization.findUnique({ where: { id: ctx.organizationId! } });
+    const s = (org?.settings as Record<string, any>) ?? {};
+    return {
+      featureFlags: { ...AdminController.FLAG_DEFAULTS.featureFlags, ...(s.featureFlags ?? {}) },
+      maintenance: { ...AdminController.FLAG_DEFAULTS.maintenance, ...(s.maintenance ?? {}) },
+      knownFlags: Object.keys(AdminController.FLAG_DEFAULTS.featureFlags),
+    };
+  }
+
+  @Put('admin/flags')
+  async putFlags(@CurrentUser() ctx: UserContext, @Body() body: any) {
+    this.requirePermission(ctx, 'org.settings.manage');
+    const org = await this.prisma.organization.findUnique({ where: { id: ctx.organizationId! } });
+    if (!org) throw new NotFoundException({ code: 'ORG_NOT_FOUND' });
+    const current = ((org.settings as Record<string, any>) ?? {}) as Record<string, any>;
+
+    let flags = current.featureFlags ?? {};
+    if (body?.flags !== undefined) {
+      flags = {
+        ...AdminController.FLAG_DEFAULTS.featureFlags,
+        ...flags,
+        ...Object.fromEntries(
+          Object.entries(body.flags).filter(([, v]) => typeof v === 'boolean'),
+        ),
+      };
+    }
+    let maintenance = current.maintenance ?? {};
+    if (body?.maintenance !== undefined) {
+      maintenance = {
+        ...maintenance,
+        enabled: body.maintenance.enabled === true,
+        message: body.maintenance.message ? String(body.maintenance.message).slice(0, 280) : null,
+      };
+    }
+
+    await this.prisma.organization.update({
+      where: { id: org.id },
+      data: { settings: { ...current, featureFlags: flags, maintenance } },
+    });
+    await this.audit.record({
+      actorUserId: ctx.id,
+      organizationId: ctx.organizationId,
+      action: 'admin.flags_changed',
+      resourceType: 'organization',
+      resourceId: org.id,
+      after: { flags, maintenance },
+    });
+    this.invalidateMaintenanceCache();
+    return { featureFlags: flags, maintenance };
+  }
+
+  /** Short-TTL cache so the per-request guard check stays cheap. */
+  private static maintenanceCache: { value: { enabled: boolean; message: string | null }; at: number } | null = null;
+  private invalidateMaintenanceCache() {
+    AdminController.maintenanceCache = null;
+  }
+  private async readMaintenance(): Promise<{ enabled: boolean; message: string | null }> {
+    if (AdminController.maintenanceCache && Date.now() - AdminController.maintenanceCache.at < 5000) {
+      return AdminController.maintenanceCache.value;
+    }
+    const internal = await this.prisma.organization.findFirst({
+      where: { type: 'INTERNAL' },
+      select: { settings: true },
+    });
+    const m = ((internal?.settings as Record<string, any>) ?? {}).maintenance ?? {};
+    const value = { enabled: m.enabled === true, message: m.message ?? null };
+    AdminController.maintenanceCache = { value, at: Date.now() };
+    return value;
   }
 
   // ---------- NOTIFICATION TEMPLATES (US-7.4) ----------

@@ -41,7 +41,8 @@ export class DocumentsController {
     return this.documentsService.getDownloadUrl(ctx, id);
   }
 
-  /** Consumes the single-use token; a second fetch fails. */
+  /** Consumes the single-use token; a second fetch fails. The token IS the credential. */
+  @Public()
   @Get('documents/:id/download')
   async download(@Param('id') id: string, @Query('token') token: string) {
     const doc = await this.documentsService.downloadByGrant(id, token);

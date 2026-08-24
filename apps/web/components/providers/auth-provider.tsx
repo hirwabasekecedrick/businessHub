@@ -32,7 +32,6 @@ interface MfaChallengeResponse {
 
 interface RegisterResult {
   message?: string;
-  devVerificationToken?: string;
 }
 
 export interface AuthContextValue {
@@ -45,6 +44,19 @@ export interface AuthContextValue {
     password: string,
   ) => Promise<LoginSuccess | MfaChallengeResponse>;
   verifyMfa: (challengeId: string, code: string) => Promise<void>;
+  /** US-1.2 forced enrolment (pre-auth challenge from MFA_ENROLMENT_REQUIRED). */
+  enrolMfaChallenge: (
+    challengeId: string,
+  ) => Promise<{ uri: string; secret: string }>;
+  completeMfaEnrolmentChallenge: (
+    challengeId: string,
+    code: string,
+  ) => Promise<{ recoveryCodes: string[] }>;
+  /** Self-service enrolment for an authenticated user. */
+  enrolMfa: () => Promise<{ uri: string; secret: string }>;
+  confirmMfa: (code: string) => Promise<{ recoveryCodes: string[] }>;
+  disableMfa: () => Promise<void>;
+  mfaRequiredForRole: boolean;
   register: (
     firstName: string,
     lastName: string,
@@ -142,6 +154,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [adoptSession],
   );
 
+  const enrolMfaChallenge = useCallback(
+    (challengeId: string) =>
+      apiFetch<{ uri: string; secret: string }>("/auth/mfa/enrol/challenge", {
+        method: "POST",
+        body: { challengeId },
+        auth: false,
+      }),
+    [],
+  );
+
+  const completeMfaEnrolmentChallenge = useCallback(
+    async (challengeId: string, code: string) => {
+      const res = await apiFetch<{
+        accessToken: string;
+        refreshToken: string;
+        recoveryCodes: string[];
+      }>("/auth/mfa/confirm/challenge", {
+        method: "POST",
+        body: { challengeId, code },
+        auth: false,
+      });
+      await adoptSession(res);
+      return { recoveryCodes: res.recoveryCodes };
+    },
+    [adoptSession],
+  );
+
+  const enrolMfa = useCallback(
+    () => apiFetch<{ uri: string; secret: string }>("/auth/mfa/enrol", { method: "POST" }),
+    [],
+  );
+
+  const confirmMfa = useCallback(async (code: string) => {
+    const res = await apiFetch<{ recoveryCodes: string[] }>("/auth/mfa/confirm", {
+      method: "POST",
+      body: { code },
+    });
+    await loadMe();
+    return res;
+  }, [loadMe]);
+
+  const disableMfa = useCallback(async () => {
+    await apiFetch<{ message: string }>("/auth/mfa", { method: "DELETE" });
+    await loadMe();
+  }, [loadMe]);
+
+  /* Spec FR-1.3: these roles can never turn MFA off. */
+  const mfaRequiredForRole =
+    !!me &&
+    me.memberships.some((m) => ["Manager", "Admin", "Super"].includes(m.roleCode));
+
   const register = useCallback(
     async (firstName: string, lastName: string, email: string, password: string) => {
       return apiFetch<RegisterResult>("/auth/register", {
@@ -153,13 +216,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [],
   );
 
-  const verifyEmail = useCallback(async (token: string) => {
-    await apiFetch<{ message: string }>("/auth/verify-email", {
-      method: "POST",
-      body: { token },
-      auth: false,
-    });
-  }, []);
+  const verifyEmail = useCallback(
+    async (token: string) => {
+      const res = await apiFetch<{
+        message: string;
+        accessToken?: string;
+        refreshToken?: string;
+      }>("/auth/verify-email", {
+        method: "POST",
+        body: { token },
+        auth: false,
+      });
+      // Present unless the account is MFA-gated, in which case the caller
+      // still has to go through the normal /auth/login + MFA challenge.
+      if (res.accessToken && res.refreshToken) {
+        await adoptSession({
+          accessToken: res.accessToken,
+          refreshToken: res.refreshToken,
+        });
+      }
+    },
+    [adoptSession],
+  );
 
   const logout = useCallback(async () => {
     const tokens = getTokens();
@@ -196,7 +274,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const can = useCallback(
     (permission: string) =>
-      !!activeMembership?.permissions.includes(permission),
+      !!activeMembership &&
+      (!!activeMembership.permissions.includes("*") ||
+        activeMembership.permissions.includes(permission)),
     [activeMembership],
   );
 
@@ -208,6 +288,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       activeMembership,
       login,
       verifyMfa,
+      enrolMfaChallenge,
+      completeMfaEnrolmentChallenge,
+      enrolMfa,
+      confirmMfa,
+      disableMfa,
+      mfaRequiredForRole,
       register,
       verifyEmail,
       logout,
@@ -221,6 +307,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       activeMembership,
       login,
       verifyMfa,
+      enrolMfaChallenge,
+      completeMfaEnrolmentChallenge,
+      enrolMfa,
+      confirmMfa,
+      disableMfa,
+      mfaRequiredForRole,
       register,
       verifyEmail,
       logout,

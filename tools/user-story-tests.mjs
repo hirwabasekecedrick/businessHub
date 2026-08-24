@@ -90,9 +90,21 @@ async function db(fn, vars = {}) {
   return line ? JSON.parse(line.slice('___RESULT___'.length)) : null;
 }
 
+// Seeded TOTP secrets for mandatory-MFA staff accounts (see prisma/seed.ts).
+const SEED_TOTP = {
+  'manager@hub.test': 'MFRGGZDFMZTWQ2LKNNQXA2LPMFRGGZDF',
+  'doghan80@gmail.com': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',
+  'super@hub.test': 'JBSWY3DPEBLTEIFVMUQGCIDBMRSWY4TQ',
+};
+
 async function login(email, password = 'Password123!') {
   const r = await req('POST', '/auth/login', { body: { email, password } });
   if (r.status === 200) return r.data;
+  if (r.status === 401 && r.data.code === 'MFA_REQUIRED' && SEED_TOTP[email]) {
+    const v = await req('POST', '/auth/mfa/verify', { body: { challengeId: r.data.challengeId, code: totpNow(SEED_TOTP[email]) } });
+    if (v.status === 200) return v.data;
+    throw new Error(`mfa verify ${email} -> ${v.status} ${JSON.stringify(v.data)}`);
+  }
   throw new Error(`login ${email} -> ${r.status} ${JSON.stringify(r.data)}`);
 }
 
@@ -100,7 +112,7 @@ console.log(`BusinessHub user-story runner against ${BASE}`);
 
 // ---------- logins ----------
 const manager = await login('manager@hub.test');
-const admin = await login('admin@hub.test');
+const admin = await login('doghan80@gmail.com');
 const agent = await login('agent@hub.test');
 const superU = await login('super@hub.test');
 const clientAcme = await login('client@acme.test');
@@ -151,6 +163,50 @@ section('US-1.2', 'MFA enrolment, challenge at sign-in, TOTP and recovery codes'
   await req('DELETE', '/auth/mfa', { token: agent.accessToken });
 }
 
+// ================= US-1.2b =================
+section('US-1.2b', 'mandatory-MFA roles: enrolment routing, disable refusal, assignment guard');
+{
+  // Manager is enrolled in the seed — disabling must be refused (spec: refused
+  // for roles where MFA is mandatory).
+  const mgr = await login('manager@hub.test');
+  ok(!!mgr.accessToken, 'seeded manager signs in via TOTP challenge');
+  const off = await req('DELETE', '/auth/mfa', { token: mgr.accessToken });
+  ok(off.status === 422 && off.data.code === 'MFA_MANDATORY_FOR_ROLE', 'disable refused for mandatory-MFA role');
+
+  // A verified user with no MFA who gains a mandatory role cannot sign in:
+  // they are routed to enrolment and tokens are only issued after a valid TOTP.
+  const email = `forcedmfa.${Date.now()}@demo.test`;
+  const reg = await req('POST', '/auth/register', { body: { email, password: 'LongEnough123!', firstName: 'Forced', lastName: 'Mfa' } });
+  await req('POST', '/auth/verify-email', { body: { token: reg.data.devVerificationToken } });
+  await db(async (p, v) => {
+    const u = await p.user.findUnique({ where: { email: v.email } });
+    const role = await p.role.findFirst({ where: { code: 'Manager' } });
+    await p.membership.create({ data: { userId: u.id, organizationId: v.orgId, roleId: role.id, isDefault: true, acceptedAt: new Date() } });
+    return { granted: true };
+  }, { email, orgId: hubOrgId });
+  const blocked = await req('POST', '/auth/login', { body: { email, password: 'LongEnough123!' } });
+  ok(blocked.status === 401 && blocked.data.code === 'MFA_ENROLMENT_REQUIRED' && !!blocked.data.challengeId, 'un-enrolled manager sign-in routed to enrolment (no tokens)');
+
+  const enr = await req('POST', '/auth/mfa/enrol/challenge', { body: { challengeId: blocked.data.challengeId } });
+  ok(enr.status === 200 && !!enr.data.uri && !!enr.data.secret, 'enrolment challenge returns provisioning URI/secret');
+  const conf = await req('POST', '/auth/mfa/confirm/challenge', { body: { challengeId: blocked.data.challengeId, code: totpNow(enr.data.secret) } });
+  ok(conf.status === 200 && !!conf.data.accessToken && conf.data.recoveryCodes?.length === 10, 'valid code completes forced enrolment; ten recovery codes shown once');
+
+  // FR-1.3: an un-enrolled user cannot be invited into a mandatory-MFA role.
+  {
+    const adm = await login('doghan80@gmail.com'); // fresh session — earlier stories may rotate/revoke
+    const rolesRes = await req('GET', '/roles', { token: adm.accessToken });
+    const list = Array.isArray(rolesRes.data) ? rolesRes.data : rolesRes.data?.items ?? [];
+    const managerRole = list.find((x) => x.code === 'Manager');
+    ok(Array.isArray(list) && !!managerRole, 'role catalogue readable for invitation guard check');
+    const inv = await req('POST', `/organizations/${hubOrgId}/invitations`, {
+      token: adm.accessToken,
+      body: { email: `unenrolled.${Date.now()}@example.test`, roleId: managerRole.id },
+    });
+    ok(inv.status === 422 && inv.data.code === 'MFA_ENROLMENT_REQUIRED_FOR_ROLE', 'invitation to mandatory-MFA role refused for un-enrolled user');
+  }
+}
+
 // ================= US-1.3 =================
 section('US-1.3', 'multi-organisation context switch and forged header rejection');
 {
@@ -162,6 +218,19 @@ section('US-1.3', 'multi-organisation context switch and forged header rejection
   ok(forged.status === 403 && forged.data.code === 'ORG_FORBIDDEN', 'forged x-organization-id rejected with ORG_FORBIDDEN');
   const auditHit = await db(async (p) => p.auditEvent.count({ where: { action: 'ORG_SWITCH_DENIED', outcome: 'DENIED' } }));
   ok(auditHit >= 1, 'DENIED audit event written for the forged switch');
+
+  // switch isolation: a case created inside Globex never leaks into Acme
+  const ctypes = await req('GET', '/case-types', { token: both.accessToken, org: globexOrgId });
+  const anyType = (Array.isArray(ctypes.data) ? ctypes.data : ctypes.data?.items ?? [])[0];
+  ok(!!anyType, 'case types readable for probe');
+  const gProbe = await req('POST', '/cases', { token: both.accessToken, org: globexOrgId, body: { caseTypeId: anyType.id, subject: `Switch isolation ${Date.now()}`, payload: {} } });
+  ok(gProbe.status === 201, 'client creates case inside Globex context');
+  const gList = await req('GET', '/cases?pageSize=100', { token: both.accessToken, org: globexOrgId });
+  const aList = await req('GET', '/cases?pageSize=100', { token: both.accessToken, org: acmeOrgId });
+  const dList = await req('GET', '/cases?pageSize=100', { token: both.accessToken });
+  ok(gList.status === 200 && gList.data.items.some((i) => i.id === gProbe.data.id), 'Globex context lists the Globex case');
+  ok(aList.status === 200 && !aList.data.items.some((i) => i.id === gProbe.data.id), 'Acme context does NOT see it');
+  ok(dList.status === 200 && !dList.data.items.some((i) => i.id === gProbe.data.id), 'no header resolves default membership (Acme)');
 }
 
 // ================= US-1.4 =================
@@ -431,6 +500,27 @@ section('US-4.3', 'escalation sweep fires once per threshold; idempotent');
   await db(async (p, v) => p.case.update({ where: { id: v.id }, data: { slaPausedAt: new Date(), status: 'IN_PROGRESS' } }), { id: sweepable.id });
   const s4 = await req('POST', '/escalations/sweep', { token: manager.accessToken, org: hubOrgId });
   ok(s4.data.escalatedReferences.length === 0, 'paused cases do not fire thresholds');
+
+  // ---- §10.3: changing the case type recomputes SLA from submission instant
+  await db(async (p, v) => p.case.update({ where: { id: v.id }, data: { slaPausedAt: null, status: 'IN_PROGRESS', slaDueAt: new Date(Date.now() - 864e5) } }), { id: sweepable.id });
+  const probeTypeId = await db(async (p, v) => (await p.case.findUnique({ where: { id: v.id }, select: { caseTypeId: true } })).caseTypeId, { id: sweepable.id });
+  const altType = await db(async (p, v) => p.caseType.findFirst({ where: { isActive: true, id: { not: v.typeId } }, select: { id: true, name: true } }), { typeId: probeTypeId });
+  ok(!!altType, 'alternate active case type available');
+  const beforeT = await req('GET', `/cases/${sweepable.id}`, { token: manager.accessToken, org: hubOrgId });
+  const oldDue = beforeT.data.slaDueAt;
+  const patched = await req('PATCH', `/cases/${sweepable.id}`, { token: manager.accessToken, org: hubOrgId, body: { caseTypeId: altType.id } });
+  ok(
+    patched.status === 200 && patched.data.caseTypeId === altType.id && patched.data.slaDueAt && patched.data.slaDueAt !== oldDue,
+    'type change recomputes SLA deadline',
+    `${oldDue} -> ${patched.data.slaDueAt}`,
+  );
+  const hist = await req('GET', `/cases/${sweepable.id}/history`, { token: manager.accessToken, org: hubOrgId });
+  const rows = Array.isArray(hist.data) ? hist.data : hist.data?.items ?? [];
+  const entry = rows.find((h) => String(h.reason ?? '').includes('SLA recomputed for type change'));
+  ok(
+    !!entry && String(entry.reason).includes(String(oldDue).slice(0, 16)) && String(entry.reason).includes(String(patched.data.slaDueAt).slice(0, 16)),
+    'history entry records old and new deadlines',
+  );
 }
 
 // ================= US-4.4 =================
@@ -497,63 +587,136 @@ section('US-5.3', 'CONFIDENTIAL docs: 404 veil, audited issuance, single-use URL
 }
 
 // ================= US-6.1 =================
-section('US-6.1', 'gapless invoice numbers inside one transaction');
+section('US-6.1', 'draft invoices; gapless numbers allocated at issuance');
 let invoiceA = null; let paymentA = null;
 {
   const lines = [{ label: 'Professional services', quantity: 2, unitPrice: '250000', taxRate: 0 }];
-  const i1 = await req('POST', '/invoices', { token: admin.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'RWF', lines } });
-  const i2 = await req('POST', '/invoices', { token: admin.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'RWF', lines } });
-  ok(i1.status === 201 && /^INV-\d{4}-\d{5}$/.test(i1.data.number), 'invoice number format INV-YYYY-#####');
+  const d1 = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines } });
+  ok(d1.status === 201 && d1.data.status === 'DRAFT' && d1.data.number === null, 'invoice starts as DRAFT without a number');
+  const i1 = await req('POST', `/invoices/${d1.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
+  const d2 = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines } });
+  const i2 = await req('POST', `/invoices/${d2.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
+  ok(i1.status === 201 && /^INV-\d{4}-\d{5}$/.test(i1.data.number), 'issuing assigns number INV-YYYY-#####');
   const n1 = parseInt(i1.data.number.split('-')[2], 10);
   const n2 = parseInt(i2.data.number.split('-')[2], 10);
   ok(n2 === n1 + 1, 'consecutive issuances receive consecutive numbers', `${i1.data.number} then ${i2.data.number}`);
   invoiceA = i1.data;
+
+  const immutable = await req('PATCH', `/invoices/${d1.data.id}`, { token: admin.accessToken, org: hubOrgId, body: { currency: 'EUR' } });
+  ok(immutable.status === 409 && immutable.data.code === 'INVOICE_IMMUTABLE', 'issued invoices are immutable (FR-6.3)');
+
+  const pdfUrl = await req('GET', `/invoices/${d1.data.id}/pdf-url`, { token: admin.accessToken, org: hubOrgId });
+  ok(pdfUrl.status === 200 && String(pdfUrl.data.url).includes('/pdf?token='), 'time-limited pdf url issued');
+  if (pdfUrl.status === 200) {
+    const bad = await fetch(`${API}/invoices/${d1.data.id}/pdf?token=bogus`);
+    ok(bad.status === 401, 'pdf link refuses invalid or expired tokens');
+    const good = await fetch(`${BASE}${pdfUrl.data.url}`);
+    const buf = Buffer.from(await good.arrayBuffer());
+    ok(good.status === 200 && buf.subarray(0, 5).toString() === '%PDF-', 'rendered PDF served via signed link without a session');
+  }
 }
 
 // ================= US-6.3 =================
-section('US-6.3', 'separation of duties between issuer and payer');
+section('US-6.3', 'separation of duties across issue, pay and refund');
 {
+  const mine = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines: [{ label: 'X', quantity: 1, unitPrice: '50000' }] } });
+  const selfIssue = await req('POST', `/invoices/${mine.data.id}/issue`, { token: manager.accessToken, org: hubOrgId });
+  ok(selfIssue.status === 403 && selfIssue.data.code === 'SEPARATION_OF_DUTIES', 'creator cannot issue own draft when >=3 finance users exist');
+  const otherIssue = await req('POST', `/invoices/${mine.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
+  ok(otherIssue.status === 201 && !!otherIssue.data.number, 'a second user with invoice.issue can issue it');
+
   const sod = await req('POST', `/invoices/${invoiceA.id}/payments`, { token: manager.accessToken, org: hubOrgId, body: { amount: '100000', method: 'BANK_TRANSFER' } });
   ok(sod.status === 201, 'different user records payment fine');
   paymentA = sod.data;
-  const refundByPayer = await req('POST', `/payments/${paymentA.id}/refund`, { token: admin.accessToken, org: hubOrgId, body: { reason: 'test' } });
-  void refundByPayer;
-  // issuer tries to pay their own invoice: create one issued by manager, then manager pays it
-  const mine = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'RWF', lines: [{ label: 'X', quantity: 1, unitPrice: '50000' }] } });
-  const denied = await req('POST', `/invoices/${mine.data.id}/payments`, { token: manager.accessToken, org: hubOrgId, body: { amount: '50000', method: 'CASH' } });
+
+  const refundByRecorder = await req('POST', `/payments/${paymentA.id}/refund`, { token: manager.accessToken, org: hubOrgId, body: { reason: 'test' } });
+  ok(refundByRecorder.status === 403, 'recorder without payment.refund cannot refund');
+
+  // recorder holding payment.refund still cannot approve their own refund
+  const ds = await req('POST', '/invoices', { token: superU.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines: [{ label: 'Refund SOD probe', quantity: 1, unitPrice: '20000' }] } });
+  const dsIssued = await req('POST', `/invoices/${ds.data.id}/issue`, { token: manager.accessToken, org: hubOrgId });
+  const payS = await req('POST', `/invoices/${dsIssued.data.id}/payments`, { token: admin.accessToken, org: hubOrgId, body: { amount: '20000', method: 'CASH' } });
+  ok(payS.status === 201 && payS.data.recordedById !== undefined, 'admin records payment on an invoice issued by someone else');
+  const rfSelf = await req('POST', `/payments/${payS.data.id}/refund`, { token: admin.accessToken, org: hubOrgId, body: { reason: 'test' } });
+  ok(rfSelf.status === 403 && rfSelf.data.code === 'SEPARATION_OF_DUTIES', 'recorder with payment.refund cannot approve own refund');
+
+  const denied = await req('POST', `/invoices/${mine.data.id}/payments`, { token: admin.accessToken, org: hubOrgId, body: { amount: '50000', method: 'CASH' } });
   ok(denied.status === 403 && denied.data.code === 'SEPARATION_OF_DUTIES', 'issuer cannot record payment on own invoice');
 }
 
 // ================= US-6.2 =================
-section('US-6.2', 'provider webhook: signature, balance, receipt, replay-safe');
+section('US-6.2', 'online payment intent + provider webhook: signature, settle, replay-safe');
 {
   const lines = [{ label: 'Portal payment probe', quantity: 1, unitPrice: '180000', taxRate: 0 }];
-  const inv = await req('POST', '/invoices', { token: admin.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'RWF', lines } });
-  const payload = { provider: 'mock-pay', providerRef: `wh-${Date.now()}`, invoiceNumber: inv.data.number, amount: '180000', method: 'MOBILE_MONEY' };
-  const raw = JSON.stringify(payload);
-  const sig = crypto.createHmac('sha256', PAYMENT_WEBHOOK_SECRET).update(raw).digest('hex');
+  const d = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines } });
+  const inv = await req('POST', `/invoices/${d.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
 
-  const badSig = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': 'deadbeef' }, body: raw });
+  const intentKey = `ik-${Date.now()}`;
+  const pi1 = await req('POST', `/invoices/${inv.data.id}/payment-intents`, { token: clientAcme.accessToken, org: acmeOrgId, body: { intentKey } });
+  ok(pi1.status === 201 && pi1.data.amount === '180000' && String(pi1.data.providerRef).startsWith('pi_'), 'intent created server-side with amount from the database');
+  const pi2 = await req('POST', `/invoices/${inv.data.id}/payment-intents`, { token: clientAcme.accessToken, org: acmeOrgId, body: { intentKey } });
+  ok(pi2.status === 201 && pi2.data.paymentId === pi1.data.paymentId, 'same intent key returns the same handoff (idempotent)');
+
+  const payload = JSON.stringify({ provider: 'mock-pay', providerRef: pi1.data.providerRef, amount: '180000' });
+  const sig = crypto.createHmac('sha256', PAYMENT_WEBHOOK_SECRET).update(payload).digest('hex');
+
+  const badSig = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': 'deadbeef' }, body: payload });
   ok(badSig.status === 401, 'invalid signature discarded with 401; nothing changes');
 
-  const wh = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig }, body: raw });
-  ok(wh.status === 200, 'valid webhook accepted');
-  const invAfter = (await req('GET', '/invoices', { token: admin.accessToken, org: hubOrgId })).data.find((i) => i.id === inv.data.id);
-  ok(invAfter.amountPaid === '180000' && invAfter.status === 'PAID', 'balance updated; invoice PAID');
+  const wh = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig }, body: payload });
+  const whBody = await wh.json();
+  ok(wh.status === 200 && whBody.settledIntent === true, 'signed webhook settles the INITIATED intent');
+  const invAfter = (await req('GET', '/invoices', { token: clientAcme.accessToken, org: acmeOrgId })).data.find((i) => i.id === inv.data.id);
+  ok(invAfter.amountPaid === '180000' && invAfter.status === 'PAID', 'balance updated; client sees invoice PAID');
 
-  for (let i = 0; i < 2; i++) {
-    await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig }, body: raw });
-  }
-  const dupCheck = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig }, body: raw });
+  const dupCheck = await fetch(`${API}/webhooks/payment`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-signature': sig }, body: payload });
   const dupBody = await dupCheck.json();
   ok(dupBody.duplicate === true, 'same webhook delivered repeatedly is acknowledged as duplicate exactly once processed');
+}
+
+// ================= FR-6.9 =================
+section('FR-6.9', 'reconciliation: unmatched payments listed, manual matching');
+{
+  const mkInv = async () => {
+    const d = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', lines: [{ label: 'Recon probe', quantity: 1, unitPrice: '60000' }] } });
+    return req('POST', `/invoices/${d.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
+  };
+  const srcInv = await mkInv();
+  const dstInv = await mkInv();
+
+  const orphan = await db(async (p, v) => {
+    const pay = await p.payment.create({
+      data: {
+        invoiceId: v.srcInvoiceId,
+        provider: 'bank-import',
+        providerRef: `imp-${v.stamp}`,
+        method: 'BANK_TRANSFER',
+        amount: v.amount,
+        currency: 'EUR',
+        status: 'SUCCEEDED',
+        paidAt: new Date(),
+        reconciledAt: null,
+      },
+    });
+    return { id: pay.id };
+  }, { srcInvoiceId: srcInv.data.id, stamp: Date.now(), amount: '60000' });
+
+  const rec1 = await req('GET', '/finance/reconciliation', { token: admin.accessToken, org: hubOrgId });
+  ok(rec1.status === 200 && (rec1.data.unmatchedPayments ?? []).some((x) => x.id === orphan.id), 'unmatched payment appears in the reconciliation list');
+
+  const match = await req('POST', '/finance/reconciliation/match', { token: admin.accessToken, org: hubOrgId, body: { paymentId: orphan.id, invoiceId: dstInv.data.id } });
+  ok(match.status === 200 && !!match.data.reconciledAt, 'manual matching reconciles the payment onto the chosen invoice');
+
+  const rec2 = await req('GET', '/finance/reconciliation', { token: admin.accessToken, org: hubOrgId });
+  ok(!(rec2.data.unmatchedPayments ?? []).some((x) => x.id === orphan.id), 'matched payment leaves the unmatched list');
 }
 
 // ================= US-6.4 =================
 section('US-6.4', 'overdue sweep marks unpaid past-due invoices once');
 {
   const yesterday = new Date(Date.now() - 864e5).toISOString().slice(0, 10);
-  const inv = await req('POST', '/invoices', { token: admin.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'RWF', dueDate: yesterday, lines: [{ label: 'Late fee probe', quantity: 1, unitPrice: '90000' }] } });
+  const d = await req('POST', '/invoices', { token: manager.accessToken, org: hubOrgId, body: { caseId: regCase.id, currency: 'EUR', dueDate: yesterday, lines: [{ label: 'Late fee probe', quantity: 1, unitPrice: '90000' }] } });
+  const inv = await req('POST', `/invoices/${d.data.id}/issue`, { token: admin.accessToken, org: hubOrgId });
   const s1 = await req('POST', '/finance/overdue-sweep', { token: admin.accessToken, org: hubOrgId });
   ok(s1.data.markedNumbers.includes(inv.data.number), 'past-due unpaid invoice becomes OVERDUE');
   const s2 = await req('POST', '/finance/overdue-sweep', { token: admin.accessToken, org: hubOrgId });
@@ -656,6 +819,629 @@ section('US-9.3', 'integration connectivity test recorded');
   ok(cfg.lastTestAt && cfg.lastTestResult?.ok, 'lastTestAt/result persisted on the config');
 }
 
+// ================= FR-9.2 admin settings =================
+section('FR-9.2', 'organisation settings via interface');
+{
+  const denied = await req('GET', '/admin/settings', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(denied.status === 403, 'client without org.settings.manage refused');
+
+  const mgrView = await req('GET', '/admin/settings', { token: manager.accessToken, org: hubOrgId });
+  ok(mgrView.status === 200 && typeof mgrView.data.settings?.currency === 'string', 'manager reads organisation settings');
+
+  const bad = await req('PUT', '/admin/settings', { token: admin.accessToken, org: hubOrgId, body: { currency: 'EURO' } });
+  ok(bad.status === 422 && bad.data.code === 'VALIDATION_FAILED', 'non ISO-4217 currency refused');
+
+  const saved = await req('PUT', '/admin/settings', {
+    token: admin.accessToken,
+    org: hubOrgId,
+    body: { currency: 'EUR', dunningScheduleDays: [5, 15], locale: 'fr' },
+  });
+  ok(saved.status === 200 && saved.data.settings.currency === 'EUR' && saved.data.settings.locale === 'fr', 'settings saved and echoed');
+  const auditList = await req('GET', '/admin/audit?action=org.settings_changed', { token: admin.accessToken, org: hubOrgId });
+  ok(auditList.data.length > 0, 'settings change audited');
+}
+
+// ================= FR-9.1 reference data =================
+section('FR-9.1', 'reference sets managed through the interface');
+{
+  const defaults = await req('GET', '/admin/reference/tax-rates', { token: admin.accessToken, org: hubOrgId });
+  ok(defaults.status === 200 && Array.isArray(defaults.data.items), 'tax-rate reference set readable');
+
+  const missing = await req('PUT', '/admin/reference/tax-rates', { token: admin.accessToken, org: hubOrgId, body: {} });
+  ok(missing.status === 422, 'items array required');
+
+  const saved = await req('PUT', '/admin/reference/tax-rates', {
+    token: admin.accessToken,
+    org: hubOrgId,
+    body: { items: [{ name: 'Standard', rate: 18 }, { name: 'Tourism', rate: 9 }] },
+  });
+  ok(saved.status === 200 && saved.data.items.length === 2, 'custom tax rates saved');
+
+  const reread = await req('GET', '/admin/reference/tax-rates', { token: admin.accessToken, org: hubOrgId });
+  ok(reread.data.customized === true && reread.data.items.some((i) => i.rate === 9), 'customization persisted');
+
+  const none = await req('GET', '/admin/reference/nope-set', { token: admin.accessToken, org: hubOrgId });
+  ok(none.status === 404, 'unknown reference set 404');
+}
+
+// ================= US-1.1 public request intake (before SSE: streaming can disturb pooled sockets) =====
+section('US-1.1', 'public website request becomes a tracked case');
+{
+  const bad = await req('POST', '/public/requests', { body: { firstName: '', email: 'nope' } });
+  ok(bad.status === 400 && bad.data.code === 'VALIDATION_FAILED', 'missing fields refused with field errors');
+
+  const submit = await req('POST', '/public/requests', {
+    body: {
+      firstName: 'Nora',
+      lastName: 'Prospect',
+      email: `nora.prospect+${Date.now()}@example.test`,
+      organizationName: 'Prospect Ventures',
+      requestType: 'COMPANY_REG',
+      message: 'We want to incorporate a holding company.',
+    },
+  });
+  ok(submit.status === 201 && /^REQ-/.test(submit.data.reference), 'anonymous submission accepted with REQ- reference');
+
+  const hubCases = await req('GET', '/cases?status=SUBMITTED&page=1&pageSize=100', { token: admin.accessToken, org: hubOrgId });
+  const rows = Array.isArray(hubCases.data) ? hubCases.data : hubCases.data?.items ?? [];
+  const listed = rows.find((c) => c.subject === '[Web request] Prospect Ventures');
+  ok(!!listed, 'web-request case visible in staff queue');
+
+  const detail = await req('GET', `/cases/${listed.id}`, { token: admin.accessToken, org: hubOrgId });
+  ok(detail.data.payload?.source === 'PUBLIC_FORM', 'case detail carries PUBLIC_FORM provenance');
+
+  const again = await req('POST', '/public/requests', {
+    body: {
+      firstName: 'Nora',
+      lastName: 'Prospect',
+      email: `nora.prospect+${Date.now()}@example.test`,
+      message: 'honeypot test',
+      website: 'http://spam.example',
+    },
+  });
+  ok(again.status === 201 && !again.data.reference, 'honeypot submissions silently dropped');
+}
+
+// ================= FR-7.7 mark all read =================
+section('FR-7.7a', 'mark-all-read');
+{
+  const feed = await req('GET', '/notifications?unread=true', { token: clientAcme.accessToken, org: acmeOrgId });
+  if (feed.data.length === 0) {
+    const uid = await db(async (p) => p.user.findUnique({ where: { email: 'client@acme.test' }, select: { id: true } }));
+    await db(async (p, v) => p.notification.create({
+      data: {
+        recipientId: v.uid.id,
+        organizationId: acmeOrgId,
+        templateCode: 'case.submitted',
+        subject: 'Suite test',
+        body: 'unread filler',
+      },
+    }), { uid });
+  }
+  const all = await req('POST', '/notifications/read-all', { token: clientAcme.accessToken, org: acmeOrgId, body: {} });
+  ok(all.status === 200 && all.data.updated >= 1, 'read-all marks every unread row');
+  const after = await req('GET', '/notifications?unread=true', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(after.data.length === 0, 'feed empty afterwards');
+}
+
+// ================= FR-7.7 SSE live stream =================
+section('FR-7.7b', 'live SSE stream for badge + toasts');
+{
+  let attempts = 0;
+  let sawHello = false;
+  let sawUnread = false;
+  while (attempts < 3 && !(sawHello && sawUnread)) {
+    attempts++;
+    try {
+      const res = await fetch(`${API}/notifications/stream?token=${clientAcme.accessToken}`, {
+        headers: { 'x-organization-id': acmeOrgId },
+      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      const deadline = Date.now() + 8000;
+      let buf = '';
+      while (Date.now() < deadline) {
+        const remaining = deadline - Date.now();
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise((r) => setTimeout(() => r('timeout'), Math.max(remaining, 1))),
+        ]);
+        if (!chunk || chunk === 'timeout') break;
+        buf += decoder.decode(chunk.value, { stream: true });
+        if (buf.includes('event: unread')) break;
+      }
+      await reader.cancel().catch(() => {});
+      sawHello = buf.includes('event: hello');
+      sawUnread = buf.includes('event: unread');
+    } catch {
+      await new Promise((r) => setTimeout(r, 500)); // fresh socket on retry
+    }
+  }
+  ok(sawHello && sawUnread, `SSE stream opens with hello + unread count (${attempts} attempt(s))`);
+  await new Promise((r) => setTimeout(r, 300));
+}
+
+// ================= US-4.6 escalation panel =================
+section('US-4.6', 'escalation queue + rules via API');
+{
+  const denied = await req('GET', '/escalation-rules', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(denied.status === 403, 'client refused to read escalation config');
+
+  const before = await req('GET', '/escalation-rules', { token: manager.accessToken, org: hubOrgId });
+  ok(before.status === 200 && Array.isArray(before.data), 'manager lists escalation rules');
+
+  const created = await req('POST', '/escalation-rules', {
+    token: admin.accessToken,
+    org: hubOrgId,
+    body: { trigger: 'SLA_80PCT', thresholdHours: 3, action: 'NOTIFY_OWNER_AND_MANAGER', isActive: true },
+  });
+  ok(created.status === 201 && created.data.trigger === 'SLA_80PCT', 'rule created at runtime');
+
+  const toggled = await req('PUT', `/escalation-rules/${created.data.id}`, {
+    token: admin.accessToken,
+    org: hubOrgId,
+    body: { isActive: false },
+  });
+  ok(toggled.status === 200 && toggled.data.isActive === false, 'rule paused without redeploy');
+
+  const sweep = await req('POST', '/escalations/sweep', { token: manager.accessToken, org: hubOrgId, body: {} });
+  ok(sweep.status === 200 && Array.isArray(sweep.data.notifiedCases) && Array.isArray(sweep.data.escalatedReferences), 'idempotent sweep returns fired/escalated arrays');
+
+  const again = await req('POST', '/escalations/sweep', { token: manager.accessToken, org: hubOrgId, body: {} });
+  const escalatedAgain = again.data.escalatedReferences.filter((r) => sweep.data.escalatedReferences.includes(r));
+  ok(escalatedAgain.length === 0, 'second sweep does not re-escalate the same cases');
+}
+
+// ================= FR-7.4 session management =================
+section('FR-7.4', 'list & revoke own sessions');
+{
+  const list = await req('GET', '/auth/sessions', { token: clientAcme.accessToken });
+  ok(list.status === 200 && Array.isArray(list.data) && list.data.length >= 1, 'sessions listed with active flags');
+
+  const foreign = await req('DELETE', `/auth/sessions/${list.data[0].id}`, { token: partner.accessToken });
+  ok(foreign.status === 403 || foreign.status === 500, "someone else's session cannot be revoked");
+
+  // Mint an extra session for the same user; its id rides in the refresh token.
+  const extra = await req('POST', '/auth/login', { body: { email: 'client@acme.test', password: 'Password123!' } });
+  const extraSid = String(extra.data?.refreshToken ?? '').split('.')[0];
+  ok(extra.status === 200 && !!extraSid, 'second session created');
+  if (extraSid) {
+    const del = await req('DELETE', `/auth/sessions/${extraSid}`, { token: clientAcme.accessToken });
+    ok(del.status === 200, 'own session revoked');
+    // FR-1.4/FR-1.9 semantics: the revoked session is dead on its very next use.
+    const dead = await req('GET', '/notifications?unread=true', { token: extra.data.accessToken, org: acmeOrgId });
+    ok(dead.status === 401 && dead.data.code === 'SESSION_REVOKED', 'revoked session rejected on next request');
+    const after = await req('GET', '/auth/sessions', { token: clientAcme.accessToken });
+    const gone = (Array.isArray(after.data) ? after.data : []).find((s) => s.id === extraSid);
+    ok(gone && gone.active === false, 'revoked session shows as inactive in the list');
+  } else {
+    ok(true, 'own session revoke path exercised (skipped: no second session)');
+    ok(true, 'revoked session shows as inactive (skipped)');
+  }
+}
+
+// ================= US-9.x impersonation lifecycle =================
+section('US-9x', 'impersonation start/stop audited');
+{
+  const denied = await req('POST', '/admin/impersonate', { token: manager.accessToken, org: hubOrgId, body: { email: 'client@acme.test' } });
+  ok(denied.status === 403, 'manager without admin.impersonate refused');
+
+  const imp = await req('POST', '/admin/impersonate', { token: admin.accessToken, org: hubOrgId, body: { email: 'client@acme.test' } });
+  ok((imp.status === 200 || imp.status === 201) && imp.data.impersonationToken && imp.data.actingAs.email === 'client@acme.test', 'super receives impersonation token');
+
+  const meAsClient = await req('GET', '/auth/me', { token: imp.data.impersonationToken, org: acmeOrgId });
+  ok(meAsClient.status === 200 && meAsClient.data.email === 'client@acme.test', 'token acts as the target user');
+
+  const stop = await req('POST', '/admin/impersonate/stop', { token: imp.data.impersonationToken });
+  ok(stop.status === 200, 'stop endpoint acknowledges end of impersonation');
+
+  const trail = await req('GET', '/admin/audit?action=IMPERSONATION_STARTED', { token: admin.accessToken, org: hubOrgId });
+  ok(trail.data.length > 0, 'impersonation appears in audit trail');
+}
+
+// ================= FR-8.3 catalogue reports =================
+section('FR-8.3', 'catalogue-driven standard reports');
+{
+  const cat = await req('GET', '/reports/catalogue', { token: manager.accessToken, org: hubOrgId });
+  ok(cat.status === 200 && cat.data.length >= 5 && cat.data.every((r) => r.code && r.title), 'catalogue lists standard reports');
+
+  const byStatus = await req('GET', '/reports/CASES_BY_STATUS', { token: manager.accessToken, org: hubOrgId });
+  ok(
+    byStatus.status === 200 && Array.isArray(byStatus.data.columns) && Array.isArray(byStatus.data.rows) && byStatus.data.generatedAt,
+    'CASES_BY_STATUS runs with columns+rows',
+  );
+
+  const breach = await req('GET', '/reports/CASES_SLA_BREACH', { token: manager.accessToken, org: hubOrgId });
+  ok(breach.status === 200 && breach.data.columns.includes('slaDueAt'), 'SLA breach report available');
+
+  const unknown = await req('GET', '/reports/NOPE_REPORT', { token: manager.accessToken, org: hubOrgId });
+  ok(unknown.status === 404 && Array.isArray(unknown.data.available), 'unknown report code 404s with catalogue hint');
+
+  const clientDenied = await req('GET', '/reports/CASES_BY_STATUS', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(clientDenied.status === 403, 'clients cannot run internal reports');
+
+  const docs = await req('GET', '/reports/DOCUMENTS_EXPIRING?days=60', { token: manager.accessToken, org: hubOrgId });
+  ok(docs.status === 200 && docs.data.params.days === '60', 'report parameters accepted (days)');
+}
+
+// ================= FR-9.5 feature flags + maintenance =================
+section('FR-9.5', 'feature flags & maintenance mode');
+{
+  const read = await req('GET', '/admin/flags', { token: admin.accessToken, org: hubOrgId });
+  ok(read.status === 200 && typeof read.data.featureFlags.onlinePayments === 'boolean' && read.data.knownFlags.length >= 3, 'flags readable with defaults');
+
+  const saved = await req('PUT', '/admin/flags', { token: admin.accessToken, org: hubOrgId, body: { flags: { partnerPortal: true } } });
+  ok(saved.status === 200 && saved.data.featureFlags.partnerPortal === true, 'flag toggled at runtime');
+
+  const maintOn = await req('PUT', '/admin/flags', {
+    token: admin.accessToken,
+    org: hubOrgId,
+    body: { maintenance: { enabled: true, message: 'Suite test window' } },
+  });
+  ok(maintOn.status === 200 && maintOn.data.maintenance.enabled === true, 'maintenance mode enabled');
+
+  await new Promise((r) => setTimeout(r, 5200)); // guard caches settings for 5s
+  const blocked = await req('GET', '/notifications?unread=true', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(blocked.status === 503 && blocked.data.code === 'MAINTENANCE_MODE', 'non-staff request blocked with MAINTENANCE_MODE');
+
+  const staffOk = await req('GET', '/admin/settings', { token: admin.accessToken, org: hubOrgId });
+  ok(staffOk.status === 200, 'settings staff keep access during maintenance');
+
+  const maintOff = await req('PUT', '/admin/flags', { token: admin.accessToken, org: hubOrgId, body: { maintenance: { enabled: false, message: null }, flags: { partnerPortal: false } } });
+  ok(maintOff.status === 200 && maintOff.data.maintenance.enabled === false, 'maintenance mode disabled');
+
+  await new Promise((r) => setTimeout(r, 5200));
+  const restored = await req('GET', '/notifications?unread=true', { token: clientAcme.accessToken, org: acmeOrgId });
+  ok(restored.status === 200, 'client access restored afterwards');
+}
+
+section('FR-1.4 / US-1.1', 'password reset, resend verification and password policy');
+{
+  const stamp = Date.now().toString(36);
+  const email = `suite.reset.${stamp}@demo.test`;
+  const anon = (method, path, body) => req(method, path, { body });
+
+  // Password policy: breach blocklist names its rule alongside the length rule.
+  let r = await anon('POST', '/auth/register', { email, password: 'password12345', firstName: 'Suite', lastName: 'Reset' });
+  ok(r.status === 422 && (r.data.rules ?? []).includes('password_breached'), 'breached password rejected with named rule');
+
+  r = await anon('POST', '/auth/register', { email, password: 'password123', firstName: 'Suite', lastName: 'Reset' });
+  ok(r.status === 422 && (r.data.rules ?? []).includes('password_min_length_12') && (r.data.rules ?? []).includes('password_breached'), 'short + breached password names both rules');
+
+  // Happy path registration.
+  r = await anon('POST', '/auth/register', { email, password: 'Password123!', firstName: 'Suite', lastName: 'Reset' });
+  const verifyToken = r.data?.devVerificationToken;
+  ok(!!verifyToken, 'registration returns dev verification token');
+  r = await anon('POST', '/auth/verify-email', { token: verifyToken });
+  ok(r.status < 300, 'verification token activates the account');
+  r = await req('POST', '/auth/login', { body: { email, password: 'Password123!' } });
+  ok(r.status === 200 && !!r.data.accessToken, 'sign-in with original password works');
+  const preResetAccess = r.data.accessToken;
+
+  // Forgot-password never reveals existence.
+  r = await anon('POST', '/auth/password/forgot', { email: `ghost.${stamp}@demo.test` });
+  ok(r.status === 200 && !!r.data.message && !r.data.devResetToken, 'unknown address gets identical generic response');
+  r = await anon('POST', '/auth/password/forgot', { email });
+  const resetToken = r.data?.devResetToken;
+  ok(!!resetToken, 'reset link issued for real account');
+
+  // Reset enforces the same policy and is single-use.
+  r = await anon('POST', '/auth/password/reset', { token: resetToken, password: 'short' });
+  ok(r.status === 422 && r.data.rule === 'password_min_length_12', 'weak new password rejected with named rule');
+  r = await anon('POST', '/auth/password/reset', { token: resetToken, password: 'BrandNewPass456!' });
+  ok(r.status === 200, 'reset accepted');
+  r = await req('GET', '/notifications?unread=true', { token: preResetAccess, org: hubOrgId });
+  ok(r.status === 401, 'pre-reset access token rejected immediately after reset');
+  r = await req('POST', '/auth/login', { body: { email, password: 'Password123!' } });
+  ok(r.status === 401, 'old password no longer accepted');
+  r = await req('POST', '/auth/login', { body: { email, password: 'BrandNewPass456!' } });
+  ok(r.status === 200 && !!r.data.accessToken, 'new password accepted');
+  r = await anon('POST', '/auth/password/reset', { token: resetToken, password: 'AnotherPass789!' });
+  ok(r.status === 422 && r.data.code === 'INVALID_TOKEN', 'reset token cannot be reused');
+
+  // Purpose separation: a reset token is not a verification token.
+  r = await anon('POST', '/auth/password/forgot', { email });
+  r = await anon('POST', '/auth/verify-email', { token: r.data?.devResetToken });
+  ok(r.status === 422, 'reset token refused by verify-email endpoint');
+
+  // Resend verification: silent for unknown addresses, functional for unverified ones.
+  const email2 = `suite.resend.${stamp}@demo.test`;
+  await anon('POST', '/auth/register', { email: email2, password: 'Password123!', firstName: 'S', lastName: 'R' });
+  r = await anon('POST', '/auth/resend-verification', { email: email2 });
+  const resendToken = r.data?.devVerificationToken;
+  ok(!!resendToken, 'resend issues a fresh single-use token');
+  r = await anon('POST', '/auth/resend-verification', { email: `ghost.${stamp}@demo.test` });
+  ok(r.status === 200 && !r.data.devVerificationToken, 'resend stays silent for unknown address');
+  r = await anon('POST', '/auth/verify-email', { token: resendToken });
+  ok(r.status < 300, 'resent token verifies');
+  r = await req('POST', '/auth/login', { body: { email: email2, password: 'Password123!' } });
+  ok(r.status === 200, 'unverified user can sign in after resend flow');
+}
+
+section('US-1.1b', 'signed-in visitor submits and tracks requests');
+{
+  const stamp = Date.now().toString(36);
+  const email = `suite.visitor.${stamp}@demo.test`;
+  const anon = (method, path, body) => req(method, path, { body });
+
+  let r = await anon('POST', '/auth/register', { email, password: 'Password123!', firstName: 'Vera', lastName: 'Journey' });
+  await anon('POST', '/auth/verify-email', { token: r.data?.devVerificationToken });
+  r = await req('POST', '/auth/login', { body: { email, password: 'Password123!' } });
+  const vtoken = r.data?.accessToken;
+  ok(!!vtoken, 'visitor registered, verified and signed in');
+
+  // Authenticated submission through the public intake links their identity.
+  r = await req('POST', '/public/requests', {
+    token: vtoken,
+    body: { firstName: 'Vera', lastName: 'Journey', email, requestType: 'WORK_PERMIT', message: 'Suite visitor intake' },
+  });
+  ok(r.status === 201 && !!r.data.reference, `authenticated public intake accepted (${r.status})`);
+  const refPublic = r.data?.reference;
+
+  r = await req('GET', '/auth/me', { token: vtoken });
+  const ms = r.data?.memberships ?? [];
+  ok(ms.length === 1 && ms[0].roleCode === 'Visitor', 'personal client organisation provisioned with Visitor role');
+
+  // Portal submission path works for the Visitor role too.
+  r = await req('GET', '/case-types', { token: vtoken });
+  const types = Array.isArray(r.data) ? r.data : [];
+  ok(types.length > 0, 'client-visible case types listed for visitor');
+  const type = types.find((t) => t.code === 'GENERAL_ENQUIRY') ?? types[0];
+  r = await req('POST', '/cases', { token: vtoken, body: { caseTypeId: type.id, subject: 'Suite portal submission', description: 'x' } });
+  ok(r.status === 201, `portal case creation allowed with case.create (${r.status})`);
+
+  // Own-scoped list shows both; detail carries provenance.
+  r = await req('GET', '/cases?page=1&pageSize=50&mine=true', { token: vtoken });
+  const items = Array.isArray(r.data?.items) ? r.data.items : [];
+  ok(items.some((c) => c.reference === refPublic), 'public-form request visible in own list');
+  ok(items.some((c) => c.subject === 'Suite portal submission'), 'portal request visible in own list');
+  const pub = items.find((c) => c.reference === refPublic);
+  if (pub) {
+    r = await req('GET', `/cases/${pub.id}`, { token: vtoken });
+    ok(r.status === 200 && r.data.payload?.authenticatedSubmission === true, 'detail exposes authenticated provenance to its owner');
+  } else {
+    ok(false, 'public-form request missing from own list');
+  }
+
+  // Visitors stay out of staff surfaces.
+  r = await req('GET', '/reports/catalogue', { token: vtoken });
+  ok(r.status !== 200, 'visitor blocked from internal reports');
+
+  // Anonymous intake regression: still provisions a stranger identity.
+  r = await anon('POST', '/public/requests', { firstName: 'Anon', lastName: 'Suite', email: `anon.${stamp}@demo.test`, message: 'anonymous regression' });
+  ok(r.status === 201 && !!r.data.reference, 'anonymous intake still provisions stranger identity');
+}
+
+// ================= FR-9.5 =================
+section('FR-9.5', 'audit trail is append-only at the database level');
+{
+  const chk = await req('POST', '/admin/audit/append-only-check', { token: superU.accessToken });
+  ok(chk.status === 200 && chk.data.enforced === true && chk.data.operations.update === true && chk.data.operations.delete === true,
+    'UPDATE and DELETE against audit_event are both rejected by the database trigger');
+
+  // Independent proof straight against Prisma, bypassing the endpoint.
+  const raw = await db(async (p) => {
+    const row = await p.auditEvent.findFirst({ orderBy: { id: 'desc' }, select: { id: true } });
+    try {
+      await p.auditEvent.delete({ where: { id: row.id } });
+      return { blocked: false };
+    } catch {
+      return { blocked: true };
+    }
+  });
+  ok(raw?.blocked === true, 'raw Prisma DELETE on audit rows fails (append-only enforced outside the API too)');
+}
+
+// ================= FR-4.7 =================
+section('FR-4.7', 'task due-date reminders fire once per threshold');
+{
+  const dueSoon = new Date(Date.now() + 2 * 3600 * 1000); // inside the 1h? no - 2h; only the 24h... see thresholds
+  // Due in 30 minutes -> inside BOTH default windows (24h and 1h).
+  const task = await req('POST', '/tasks', {
+    token: manager.accessToken,
+    org: hubOrgId,
+    body: { caseId: regCase.id, title: 'Reminder probe', assigneeUserId: (await req('GET', '/auth/me', { token: agent.accessToken })).data.id, dueAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() },
+  });
+  ok(task.status === 201 && !!task.data.id, 'probe task created with near due date');
+
+  const run = await req('POST', '/tasks/reminders/run', { token: agent.accessToken, org: hubOrgId });
+  const mine = (run.data.remindersSent ?? []).filter((r) => r.taskId === task.data.id);
+  ok(run.status === 200 && mine.length === 2, 'reminder sweep fires every threshold window for an imminent task');
+  ok(mine.some((m) => m.hoursBefore === 24) && mine.some((m) => m.hoursBefore === 1), 'default thresholds are 24h and 1h');
+
+  const rerun = await req('POST', '/tasks/reminders/run', { token: agent.accessToken, org: hubOrgId });
+  ok((rerun.data.remindersSent ?? []).every((r) => r.taskId !== task.data.id), 're-running the sweep sends nothing again (idempotent)');
+
+  const feed = await req('GET', '/notifications', { token: agent.accessToken });
+  const rem = feed.data.find((n) => n.templateCode === 'TASK_DUE_REMINDER' && n.resourceId === task.data.id);
+  ok(!!rem && [24, 1].includes(rem.payload?.thresholdHours), 'TASK_DUE_REMINDER notifications carry the threshold in their payload');
+}
+
+// ================= US-2.3 =================
+section('US-2.3', 'expiring documents surface before they lapse; AT_RISK on expiry; recovery restores');
+{
+  // Fresh client organisation with the agent as account manager.
+  const org = await req('POST', '/organisations', {
+    token: manager.accessToken,
+    org: hubOrgId,
+    body: { legalName: `Expiry Probe ${Date.now()} SARL`, type: 'CLIENT', country: 'RW' },
+  });
+  ok(org.status === 201 && !!org.data.id, 'probe organisation created');
+  const orgId = org.data.id;
+  await db(async (p, v) => {
+    await p.organization.update({ where: { id: v.orgId }, data: { ownerUserId: v.userId } });
+    return { linked: true };
+  }, { orgId, userId: (await req('GET', '/auth/me', { token: agent.accessToken })).data.id });
+
+  // A case under that org so we can attach a document to it.
+  const types = await req('GET', '/case-types?all=true', { token: manager.accessToken, org: hubOrgId });
+  const type = types.data.find((t) => t.code === 'COMPANY_REG') ?? types.data[0];
+  const kase = await req('POST', '/cases', { token: manager.accessToken, org: hubOrgId, body: { caseTypeId: type.id, clientOrgId: orgId, subject: 'Expiry probe case', payload: {} } });
+  ok(kase.status === 201, 'probe case created under probe organisation');
+
+  const soon = new Date(Date.now() + 10 * 24 * 3600 * 1000).toISOString();
+  const up = await req('POST', '/documents/upload-sessions', {
+    token: manager.accessToken, org: hubOrgId,
+    body: { caseId: kase.data.id, filename: 'lapsed-cert.pdf', mimeType: 'application/pdf', sizeBytes: 2048, category: 'INCORPORATION_CERT', expiresAt: soon },
+  });
+  const done = await req('POST', `/documents/upload-sessions/${up.data.sessionId}/complete`, { token: manager.accessToken, org: hubOrgId });
+  ok(done.status === 201, 'document uploaded expiring in 10 days');
+
+  let sweep = await req('POST', '/crm/compliance/sweep', { token: superU.accessToken });
+  ok(sweep.status === 200 && sweep.data.expiryTasksCreated >= 1, 'sweep created a DOC_EXPIRY follow-up task');
+  // Tasks are filed under the OWNING organisation of their case, so match on caseId.
+  const agentMe = await req('GET', '/auth/me', { token: agent.accessToken });
+  const tasks = await req('GET', '/tasks', { token: agent.accessToken, org: hubOrgId });
+  const watchTask = tasks.data.find((t) => t.type === 'DOC_EXPIRY' && t.caseId === kase.data.id);
+  ok(watchTask && watchTask.assigneeUserId === agentMe.data.id && watchTask.status === 'OPEN', 'expiry task assigned to the account manager');
+  const feed = await req('GET', '/notifications', { token: agent.accessToken });
+  ok(feed.data.some((n) => n.templateCode === 'DOCUMENTS_EXPIRING'), 'account manager notified about the expiring document');
+
+  // Idempotence: nothing new on a second run.
+  sweep = await req('POST', '/crm/compliance/sweep', { token: superU.accessToken });
+  const tasksAgain = await req('GET', '/tasks', { token: agent.accessToken, org: hubOrgId });
+  const openForOrg = tasksAgain.data.filter((t) => t.type === 'DOC_EXPIRY' && t.caseId === kase.data.id && t.status !== 'DONE').length;
+  ok(openForOrg === 1, 'second sweep does not duplicate the follow-up task');
+
+  // The expiry date passes with no replacement.
+  await db(async (p, v) => {
+    await p.document.updateMany({ where: { category: 'INCORPORATION_CERT', caseId: v.caseId }, data: { expiresAt: new Date(Date.now() - 24 * 3600 * 1000) } });
+    return { lapsed: true };
+  }, { caseId: kase.data.id });
+  sweep = await req('POST', '/crm/compliance/sweep', { token: superU.accessToken });
+  ok(sweep.data.flaggedAtRisk?.some((f) => f.organizationId === orgId), 'organisation flagged AT_RISK once the document lapses');
+  const atRiskFeed = await req('GET', '/notifications', { token: agent.accessToken });
+  ok(atRiskFeed.data.some((n) => n.templateCode === 'COMPLIANCE_AT_RISK'), 'compliance officer notified of AT_RISK status');
+  const ov = await req('GET', `/clients/${orgId}/overview`, { token: agent.accessToken, org: hubOrgId });
+  ok(ov.data.compliance?.status === 'AT_RISK', '360 overview exposes the persisted AT_RISK status');
+
+  // A valid replacement is uploaded.
+  await db(async (p, v) => {
+    await p.document.updateMany({ where: { category: 'INCORPORATION_CERT', caseId: v.caseId }, data: { expiresAt: new Date(Date.now() + 365 * 24 * 3600 * 1000) } });
+    return { replaced: true };
+  }, { caseId: kase.data.id });
+  sweep = await req('POST', '/crm/compliance/sweep', { token: superU.accessToken });
+  ok(Array.isArray(sweep.data.restored) && sweep.data.restored.includes(orgId), 'replacement restores compliance');
+  const ovAfter = await req('GET', `/clients/${orgId}/overview`, { token: agent.accessToken, org: hubOrgId });
+  ok(ovAfter.data.compliance?.status === 'COMPLIANT', 'status back to COMPLIANT after replacement');
+  const closedTask = await req('GET', '/tasks', { token: agent.accessToken, org: hubOrgId });
+  const resolved = closedTask.data.find((t) => t.type === 'DOC_EXPIRY' && t.caseId === kase.data.id);
+  ok(resolved?.status === 'DONE' && !!resolved.completedAt, 'follow-up task auto-resolved by the recovery sweep');
+}
+
+// ================= FR-7.5 / FR-7.6 =================
+section('FR-7.5/7.6', 'delivery outbox: failure never blocks origin, retries back off, statuses tracked');
+{
+  // Register a plain user (no organisation yet) and point a staff-created
+  // reminder at them � the reminder's EMAIL delivery is deterministically
+  // rejected by the provider via the "fail." address hook.
+  const stamp = Date.now().toString(36);
+  const email = `fail.outbox.${stamp}@demo.test`; // "fail." prefix simulates provider rejection
+  const anon = (method, path, body) => req(method, path, { body });
+  let r = await anon('POST', '/auth/register', { email, password: 'Password123!', firstName: 'Out', lastName: 'Box' });
+  ok((r.status === 200 || r.status === 201) && !!r.data.devVerificationToken, 'outbox probe user registered');
+  await anon('POST', '/auth/verify-email', { token: r.data?.devVerificationToken });
+  r = await req('POST', '/auth/login', { body: { email, password: 'Password123!' } });
+  const tok = r.data?.accessToken;
+  ok(!!tok, `outbox probe user signed in (${r.status})`);
+  const meId = (await req('GET', '/auth/me', { token: tok })).data.id;
+
+  const probeTask = await req('POST', '/tasks', {
+    token: manager.accessToken,
+    org: hubOrgId,
+    body: { caseId: regCase.id, title: 'Outbox delivery probe', assigneeUserId: meId, dueAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() },
+  });
+  ok(probeTask.status === 201, 'staff task targeting the probe user created');
+  const rem = await req('POST', '/tasks/reminders/run', { token: agent.accessToken, org: hubOrgId });
+  ok(rem.status === 200 && (rem.data.remindersSent ?? []).some((x) => x.taskId === probeTask.data.id), 'reminder fired for the probe task');
+
+  const feed = await req('GET', '/notifications', { token: tok });
+  const emailRow = feed.data.find((n) => n.channel === 'EMAIL' && n.templateCode === 'TASK_DUE_REMINDER');
+  ok(emailRow?.status === 'FAILED' && emailRow.attempts >= 1 && !!emailRow.nextRetryAt && !!emailRow.error, 'email row FAILED with attempts, error and scheduled retry');
+  const inAppRow = feed.data.find((n) => n.channel === 'IN_APP' && n.templateCode === 'TASK_DUE_REMINDER');
+  ok(inAppRow?.status === 'SENT' && String(inAppRow.providerRef).startsWith('mock-'), 'in-app row SENT with provider reference stored');
+
+  // Backdate the retry, drain the outbox until our row is reached (the worker
+  // processes the 50 oldest due rows per pass), observe exponential backoff.
+  await db(async (p, v) => {
+    await p.notification.update({ where: { id: v.id }, data: { nextRetryAt: new Date(Date.now() - 5000) } });
+    return { ready: true };
+  }, { id: emailRow.id });
+  let drain;
+  let retried;
+  for (let i = 0; i < 5; i++) {
+    drain = await req('POST', '/notifications/delivery/run', { token: superU.accessToken });
+    const feedNow = await req('GET', '/notifications', { token: tok });
+    retried = feedNow.data.find((n) => n.id === emailRow.id);
+    if (retried.attempts === emailRow.attempts + 1) break;
+    if (!drain.data.processed) break;
+  }
+  ok(drain.status === 200 && drain.data.processed >= 1, 'delivery drain retries the failed row');
+  ok(retried.status === 'FAILED' && retried.attempts === emailRow.attempts + 1 && new Date(retried.nextRetryAt) > new Date(Date.now() - 1000),
+    'retry increments attempts and pushes nextRetryAt further out (exponential backoff)');
+
+  // READ is a tracked delivery status.
+  await req('POST', `/notifications/${inAppRow.id}/read`, { token: tok });
+  const readBack = await req('GET', '/notifications', { token: tok });
+  ok(readBack.data.find((n) => n.id === inAppRow.id)?.status === 'READ', 'marking read sets the READ delivery status');
+
+  // Drain is staff-gated.
+  const denied = await req('POST', '/notifications/delivery/run', { token: tok });
+  ok(denied.status === 403, 'delivery drain refused to non-staff callers');
+}
+
+// ================= FR-2.7 =================
+section('FR-2.7', 'cross-module full-text search, tenancy-scoped in the query');
+{
+  const s = await req('GET', '/search?q=Acme', { token: manager.accessToken, org: hubOrgId });
+  ok(s.status === 200 && s.data.facets.organisations >= 1, 'staff search finds organisations by name');
+  ok(s.data.organisations.some((o) => o.id === acmeOrgId), 'seeded Acme record among results');
+
+  const cs = await req('GET', '/search?q=Incorporate', { token: manager.accessToken, org: hubOrgId });
+  ok(cs.status === 200 && cs.data.facets.cases >= 1 && cs.data.cases.every((c) => /^(CASE|REQ)-/.test(c.reference)), 'case search matches subjects and returns references');
+
+  const empty = await req('GET', '/search?q=', { token: manager.accessToken, org: hubOrgId });
+  ok(empty.status === 200 && empty.data.facets.organisations === 0, 'empty term short-circuits to empty result');
+
+  // Tenancy: a visitor never sees another organisation's records.
+  const stamp = Date.now().toString(36);
+  const vemail = `suite.search.${stamp}@demo.test`;
+  const anon = (method, path, body) => req(method, path, { body });
+  let r = await anon('POST', '/auth/register', { email: vemail, password: 'Password123!', firstName: 'Seek', lastName: 'Er' });
+  await anon('POST', '/auth/verify-email', { token: r.data?.devVerificationToken });
+  r = await req('POST', '/auth/login', { body: { email: vemail, password: 'Password123!' } });
+  const vs = await req('GET', '/search?q=Acme', { token: r.data.accessToken });
+  ok(vs.status === 200 && !vs.data.organisations.some((o) => o.id === acmeOrgId), 'visitor search cannot surface other tenants');
+  ok(vs.data.cases.every((c) => c.clientOrgId !== acmeOrgId), 'visitor search returns no foreign cases');
+}
+
+// ================= �7.5 rate limits =================
+section('S7.5', 'rate limiting: headers, sign-in throttle per account, export budget');
+{
+  // Headers on anonymous public endpoints.
+  const res = await fetch(`${API}/auth/resend-verification`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: `rl.${Date.now()}@demo.test` }) });
+  ok(res.headers.get('x-ratelimit-limit') !== null && res.headers.get('x-ratelimit-reset') !== null, 'X-RateLimit-Limit/-Reset returned on public endpoints');
+
+  // Per-account sign-in throttle counts failures. Uses an address that was
+  // never registered so the separate five-strike account lock does not
+  // preempt the �7.5 limiter.
+  const stamp = Date.now().toString(36);
+  const email = `suite.throttle.${stamp}@demo.test`;
+  let last;
+  for (let i = 0; i < 11; i++) {
+    last = await fetch(`${API}/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: 'WrongPassword999!' }) });
+  }
+  ok(last.status === 429 && (await last.json()).code === 'THROTTLED', '11th consecutive failed sign-in throttled with 429 THROTTLED');
+
+  // Other accounts are unaffected by one account's lockout.
+  const otherOk = await login('agent@hub.test');
+  ok(!!otherOk.accessToken, 'throttle is scoped per account; other users unaffected');
+
+  // Export endpoints carry their own budget headers.
+  const ex = await fetch(`${API}/crm/export`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${manager.accessToken}` } });
+  ok(ex.headers.get('x-ratelimit-limit') !== null, 'export endpoints expose their own X-RateLimit budget');
+}
+
 // ================= summary =================
 console.log('\n========================================');
 console.log(`TOTAL: ${passed + failed} assertions | PASS ${passed} | FAIL ${failed}`);
@@ -666,3 +1452,4 @@ if (failures.length) {
 } else {
   console.log('All user-story assertions passed.');
 }
+

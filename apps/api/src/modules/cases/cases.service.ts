@@ -11,7 +11,7 @@ import { PrismaService } from '../../common/prisma.service';
 import { AuditService } from '../../common/audit.service';
 import { NotificationService } from '../../common/notification.service';
 import { getTransition } from './transitions';
-import { computeSlaDueAt } from '../../common/sla.util';
+import { BusinessCalendar, computeSlaDueAt } from '../../common/sla.util';
 
 const REASONS_REQUIRED = new Set(['ON_HOLD', 'REJECTED', 'ESCALATED', 'AWAITING_INFO']);
 
@@ -123,7 +123,14 @@ export class CasesService {
   }
 
   async listCases(ctx: UserContext, query: any) {
-    this.requirePermission(ctx, 'case.read.org');
+    // Visitors and clients hold only case.read.own; staff hold case.read.org.
+    if (
+      !ctx.permissions.includes('case.read.org') &&
+      !ctx.permissions.includes('case.read.all') &&
+      !ctx.permissions.includes('case.read.own')
+    ) {
+      throw new ForbiddenException({ code: 'PERMISSION_DENIED', required: 'case.read.own' });
+    }
     const where: Prisma.CaseWhereInput = { deletedAt: null };
 
     // Tenant scoping enforced in the query (never filtered after the fact).
@@ -135,9 +142,11 @@ export class CasesService {
     } else if (canReadOrg) {
       where.OR = [{ organizationId: ctx.organizationId }, { clientOrgId: ctx.organizationId }];
     } else if (canReadOwn) {
+      // US-1.3 isolation: visibility follows the ACTIVE organisation only —
+      // other memberships must never widen a portal user's view.
       where.AND = [
         { OR: [{ organizationId: ctx.organizationId }, { clientOrgId: ctx.organizationId }] },
-        { OR: [{ ownerUserId: ctx.id }, { createdBy: ctx.id }, { clientOrgId: { in: ctx.memberships?.map((m) => m.organizationId) } }] },
+        { OR: [{ ownerUserId: ctx.id }, { createdBy: ctx.id }] },
       ];
     } else {
       throw new ForbiddenException({ code: 'PERMISSION_DENIED', required: 'case.read.own' });
@@ -201,18 +210,54 @@ export class CasesService {
   }
 
   async updateCase(ctx: UserContext, caseId: string, data: any) {
-    const record = await this.prisma.case.findUnique({ where: { id: caseId } });
+    const record = await this.prisma.case.findUnique({
+      where: { id: caseId },
+      include: { caseType: { select: { id: true, name: true } } },
+    });
     if (!record || record.deletedAt) throw new NotFoundException({ code: 'CASE_NOT_FOUND' });
     this.caseAbility.canWrite(ctx, record, false);
 
-    const updated = await this.prisma.case.update({
-      where: { id: caseId },
-      data: {
-        subject: data.subject,
-        description: data.description,
-        payload: data.payload,
-        priority: data.priority,
-      },
+    // §10.3: changing the case type after submission re-derives the SLA
+    // deadline from the original submission instant and records both values.
+    let slaDueAt: Date | undefined;
+    if (data.caseTypeId && data.caseTypeId !== record.caseTypeId) {
+      const nextType = await this.prisma.caseType.findFirst({
+        where: { id: data.caseTypeId, isActive: true },
+      });
+      if (!nextType) {
+        throw new UnprocessableEntityException({ code: 'VALIDATION_FAILED', fieldErrors: ['caseTypeId'] });
+      }
+      const calendar =
+        (((await this.prisma.organization.findUnique({ where: { id: record.organizationId }, select: { settings: true } }))
+          ?.settings as any)?.calendar as Partial<BusinessCalendar>) ?? {};
+      slaDueAt = computeSlaDueAt(record.submittedAt ?? new Date(), nextType.slaHours ?? 72, calendar);
+    }
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const row = await tx.case.update({
+        where: { id: caseId },
+        data: {
+          subject: data.subject,
+          description: data.description,
+          payload: data.payload,
+          priority: data.priority,
+          ...(slaDueAt ? { caseTypeId: data.caseTypeId, slaDueAt } : {}),
+        },
+      });
+      if (slaDueAt) {
+        await tx.caseStatusHistory.create({
+          data: {
+            caseId,
+            fromStatus: record.status,
+            toStatus: record.status,
+            reason: `SLA recomputed for type change (${record.caseType?.name ?? record.caseTypeId} → ${data.caseTypeId}): ${
+              record.slaDueAt?.toISOString() ?? 'none'
+            } → ${slaDueAt.toISOString()}`,
+            actorId: ctx.id,
+          },
+        });
+      }
+      return row;
     });
     return updated;
   }

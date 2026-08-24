@@ -92,8 +92,7 @@ async function refreshTokens(): Promise<boolean> {
 export async function apiFetch<T>(
   path: string,
   { method = "GET", body, auth = true }: ApiFetchOptions = {},
-): Promise<T> {
-  const headers: Record<string, string> = {
+): Promise<T> {  const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
   if (auth) {
@@ -129,4 +128,42 @@ export async function apiFetch<T>(
 
   if (!res.ok) throw new ApiError(res.status, data);
   return data as T;
+}
+
+/** URL for an EventSource — auth travels as ?token= since SSE cannot set headers. */
+export function sseUrl(path: string): string | null {
+  if (typeof window === "undefined") return null;
+  const tokens = getTokens();
+  if (!tokens?.accessToken) return null;
+  const params = new URLSearchParams({ token: tokens.accessToken });
+  return `${API_URL}${path}?${params.toString()}`;
+}
+
+/* ----------------------------- impersonation ------------------------------ */
+
+const IMP_KEY = "businesshub.impersonation";
+
+export function beginImpersonation(impersonationToken: string) {
+  const backup = getTokens();
+  window.localStorage.setItem(IMP_KEY, JSON.stringify(backup));
+  setTokens({ accessToken: impersonationToken, refreshToken: "" });
+}
+
+export function isImpersonating(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.localStorage.getItem(IMP_KEY) !== null;
+}
+
+/** Restores the super-admin session. Call the audit endpoint BEFORE this. */
+export function stopImpersonation() {
+  const raw = window.localStorage.getItem(IMP_KEY);
+  if (!raw) return;
+  try {
+    const backup = JSON.parse(raw) as Tokens | null;
+    if (backup?.accessToken && backup?.refreshToken) setTokens(backup);
+    else clearTokens();
+  } catch {
+    clearTokens();
+  }
+  window.localStorage.removeItem(IMP_KEY);
 }

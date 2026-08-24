@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 
 import { AuthProvider } from "@/components/providers/auth-provider";
+import { QueryProvider } from "@/components/providers/query-provider";
+import { Toaster } from "@/components/ui/sonner";
 
 import "./globals.css";
 
@@ -22,6 +24,15 @@ export const metadata: Metadata = {
   },
   description:
     "Business registration, case management and compliance operations hub.",
+  icons: {
+    icon: [
+      { url: "/favicon/favicon.ico", sizes: "any" },
+      { url: "/favicon/favicon.svg", type: "image/svg+xml" },
+      { url: "/favicon/favicon-96x96.png", sizes: "96x96", type: "image/png" },
+    ],
+    apple: "/favicon/apple-touch-icon.png",
+  },
+  manifest: "/favicon/site.webmanifest",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -31,7 +42,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <AuthProvider>{children}</AuthProvider>
+        <QueryProvider>
+          <AuthProvider>{children}</AuthProvider>
+        </QueryProvider>
+        <Toaster richColors position="top-right" />
       </body>
     </html>
   );

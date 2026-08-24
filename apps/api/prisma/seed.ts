@@ -1,5 +1,5 @@
-/**
- * Seed per spec §16: one operating company, two client orgs, one partner org,
+﻿/**
+ * Seed per spec Â§16: one operating company, two client orgs, one partner org,
  * one user per role (Password123!), reference data and demo contacts.
  * Aborts unless NODE_ENV is local/development/ci/test.
  */
@@ -27,11 +27,12 @@ function hash(value: string) {
 }
 
 const PERMISSIONS = {
-  Visitor: ['notification.read'],
+  Visitor: ['notification.read', 'case.create', 'case.read.own'],
   Client: [
     'case.read.own', 'case.create', 'case.update',
     'document.read', 'document.upload',
     'crm.read',
+    'finance.read',
     'notification.read',
   ],
   Partner: [
@@ -45,14 +46,14 @@ const PERMISSIONS = {
     'org.read',
     'role.read',
     'crm.read', 'crm.create', 'crm.update',
-    'case.read.org', 'case.create', 'case.update', 'case.transition',
+    'case.read.org', 'case.read.own', 'case.create', 'case.update', 'case.transition',
     'task.read', 'task.create', 'task.complete',
     'approval.read',
     'document.read', 'document.upload', 'document.download',
     'finance.read',
     'report.read',
     'notification.read',
-  
+
     'approval.read',
     'approval.decide',
   ],
@@ -61,7 +62,7 @@ const PERMISSIONS = {
     'org.read', 'org.update', 'org.settings.manage',
     'role.read', 'role.assign',
     'crm.read', 'crm.create', 'crm.update', 'crm.delete', 'crm.export',
-    'case.read.org', 'case.create', 'case.update', 'case.assign', 'case.transition', 'case.close', 'case.reopen',
+    'case.read.org', 'case.read.own', 'case.create', 'case.update', 'case.assign', 'case.transition', 'case.close', 'case.reopen',
     'task.read', 'task.create', 'task.assign', 'task.complete', 'task.reassign',
     'approval.read', 'approval.decide',
     'document.read', 'document.upload', 'document.download', 'document.classify', 'document.sign.request',
@@ -74,7 +75,7 @@ const PERMISSIONS = {
     'org.read', 'org.create', 'org.update', 'org.suspend', 'org.settings.manage',
     'role.read', 'role.assign', 'role.manage',
     'crm.read', 'crm.create', 'crm.update', 'crm.delete', 'crm.export',
-    'case.read.org', 'case.create', 'case.update', 'case.assign', 'case.transition', 'case.close', 'case.reopen', 'case.delete',
+    'case.read.org', 'case.read.own', 'case.create', 'case.update', 'case.assign', 'case.transition', 'case.close', 'case.reopen', 'case.delete',
     'task.read', 'task.create', 'task.assign', 'task.complete', 'task.reassign',
     'approval.read', 'approval.decide', 'approval.override',
     'document.read', 'document.upload', 'document.download', 'document.classify', 'document.delete', 'document.sign.request',
@@ -181,6 +182,13 @@ async function main() {
   }
 
   // --- Users: exactly one per role ---
+  // FR-1.3: Manager/Admin/Super are mandatory-MFA roles, so their seed
+  // accounts ship enrolled with fixed TOTP secrets (documented in tools/).
+  const MFA_SECRETS: Record<string, string> = {
+    'manager@hub.test': 'MFRGGZDFMZTWQ2LKNNQXA2LPMFRGGZDF',
+    'doghan80@gmail.com': 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ',
+    'super@hub.test': 'JBSWY3DPEBLTEIFVMUQGCIDBMRSWY4TQ',
+  };
   const users: Array<{ email: string; first: string; last: string; role: string; orgs: Array<[string, boolean]> }> = [
     { email: 'visitor@demo.test', first: 'Vera', last: 'Visitor', role: 'Visitor', orgs: [[acme.id, true]] },
     { email: 'client@acme.test', first: 'Clara', last: 'Client', role: 'Client', orgs: [[acme.id, true]] },
@@ -188,14 +196,21 @@ async function main() {
     { email: 'partner@consulting.test', first: 'Paul', last: 'Partner', role: 'Partner', orgs: [[partner.id, true]] },
     { email: 'agent@hub.test', first: 'Alice', last: 'Agent', role: 'Agent', orgs: [[hub.id, true]] },
     { email: 'manager@hub.test', first: 'Marcel', last: 'Manager', role: 'Manager', orgs: [[hub.id, true]] },
-    { email: 'admin@hub.test', first: 'Nadia', last: 'Admin', role: 'Admin', orgs: [[hub.id, true]] },
+    { email: 'doghan80@gmail.com', first: 'Nadia', last: 'Admin', role: 'Admin', orgs: [[hub.id, true]] },
     { email: 'super@hub.test', first: 'Sam', last: 'Super', role: 'Super', orgs: [[hub.id, true]] },
   ];
 
   for (const u of users) {
+    const mfaSecret = MFA_SECRETS[u.email] ?? null;
     const user = await prisma.user.upsert({
       where: { email: u.email },
-      update: { passwordHash: password, status: 'ACTIVE', emailVerifiedAt: userExists(u.email) ? undefined : new Date() },
+      update: {
+        passwordHash: password,
+        status: 'ACTIVE',
+        emailVerifiedAt: userExists(u.email) ? undefined : new Date(),
+        mfaSecret,
+        mfaEnabledAt: mfaSecret ? new Date() : null,
+      },
       create: {
         email: u.email,
         passwordHash: password,
@@ -205,6 +220,8 @@ async function main() {
         emailVerifiedAt: new Date(),
         locale: 'en',
         timezone: 'Africa/Kigali',
+        mfaSecret,
+        mfaEnabledAt: mfaSecret ? new Date() : null,
       },
     });
     for (const [orgId, isDefault] of u.orgs) {
@@ -238,7 +255,7 @@ async function main() {
       properties: {
         proposedName: { type: 'string', title: 'Proposed company name' },
         sector: { type: 'string', enum: ['TRADE', 'SERVICES', 'MANUFACTURING', 'TECH'], title: 'Business sector' },
-        shareCapital: { type: 'number', title: 'Share capital (RWF)' },
+        shareCapital: { type: 'number', title: 'Share capital (EUR)' },
       },
     },
     requiredDocs: ['INCORPORATION_CERT'],
@@ -271,6 +288,18 @@ async function main() {
     slaHours: 120,
     approvalLevels: 1,
     isClientVisible: false,
+  });
+  await upsertCaseType({
+    code: 'GENERAL_ENQUIRY',
+    name: 'General Enquiry',
+    description: 'Public website request triaged by the hub team',
+    formSchema: {
+      type: 'object',
+      properties: {},
+    },
+    requiredDocs: [],
+    slaHours: 24,
+    approvalLevels: 0,
   });
 
   // --- Process template for COMPANY_REG (v1) ---
@@ -404,3 +433,5 @@ main()
     process.exit(1);
   })
   .finally(() => prisma.$disconnect());
+
+

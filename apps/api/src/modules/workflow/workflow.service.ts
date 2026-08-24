@@ -9,6 +9,7 @@ import { UserContext } from '../../common/abilities/case-ability.service';
 import { PrismaService } from '../../common/prisma.service';
 import { AuditService } from '../../common/audit.service';
 import { NotificationService } from '../../common/notification.service';
+import { BusinessCalendar, workingMsBetween } from '../../common/sla.util';
 
 @Injectable()
 export class WorkflowService {
@@ -244,6 +245,9 @@ export class WorkflowService {
     });
 
     const kase = approval.task.case;
+    if (!kase) {
+      throw new NotFoundException({ code: 'CASE_NOT_FOUND' });
+    }
     if (decision === 'REJECTED') {
       await this.applyCaseTransition(kase.id, kase.status, 'REJECTED', comment ?? '', ctx.id);
       await this.notifications.notify({
@@ -372,8 +376,14 @@ export class WorkflowService {
   }
 
   /**
-   * US-4.3: escalation sweep. Idempotent — escalationFiredAt guarantees a single
-   * notification per case even if the sweep runs twice in the same minute.
+   * US-4.3 + FR-4.6 escalation sweep.
+   * - Thresholds come from the configured EscalationRule rows (global and
+   *   per-case-type); when none exist the classic 80% warning still applies.
+   * - §10.3: progress is measured in WORKING time against the organisation's
+   *   business calendar; the wall-clock ratio is also honoured so a deadline
+   *   that is objectively about to pass never goes unwarned.
+   * - Idempotent: each case × threshold combination fires at most once (checked
+   *   via the notification ledger), independent of sweep restarts.
    */
   async sweep(ctx: UserContext) {
     const now = new Date();
@@ -384,22 +394,78 @@ export class WorkflowService {
         status: { in: ['ASSIGNED', 'IN_PROGRESS', 'SUBMITTED', 'QUALIFIED', 'IN_REVIEW'] },
         submittedAt: { not: null },
       },
-      include: { ownerUser: true },
+      include: { ownerUser: true, caseType: { select: { id: true } } },
     });
+
+    const rules = await this.prisma.escalationRule.findMany({ where: { isActive: true } });
+    // Thresholds keyed by scope: '*' = global, otherwise the case type id.
+    const scopedRules = new Map<string, Map<number, { action: string | null; targetRoleId: string | null }>>();
+    const noActivityHours: number[] = [];
+    for (const r of rules) {
+      const m = /^SLA_(\d+)(?:PCT)?$/i.exec(r.trigger);
+      if (!m) {
+        if (/^NO_ACTIVITY$/i.test(r.trigger) && !noActivityHours.includes(r.thresholdHours ?? 72)) {
+          noActivityHours.push(r.thresholdHours ?? 72);
+        }
+        continue;
+      }
+      const key = r.caseTypeId ?? '*';
+      if (!scopedRules.has(key)) scopedRules.set(key, new Map());
+      const map = scopedRules.get(key)!;
+      const pct = Math.min(100, Math.max(1, Number(m[1])));
+      if (!map.has(pct)) map.set(pct, { action: r.action, targetRoleId: r.targetRoleId });
+    }
+    // A case obeys its type's rules on top of the global ones; when nothing
+    // is configured at all the classic 80% warning still applies.
+    const thresholdsFor = (caseTypeId: string | null | undefined) => {
+      const merged = new Map<number, { action: string | null; targetRoleId: string | null }>(
+        scopedRules.get('*') ?? [],
+      );
+      for (const [pct, rule] of scopedRules.get(caseTypeId ?? '\u0000') ?? []) {
+        if (!merged.has(pct)) merged.set(pct, rule);
+      }
+      if (merged.size === 0) merged.set(80, { action: null, targetRoleId: null });
+      return [...merged.entries()].sort((a, b) => a[0] - b[0]);
+    };
+
+    // Per-organisation calendar cache (settings.calendar overrides the default).
+    const calendars = new Map<string, Partial<BusinessCalendar>>();
+    const calendarFor = async (orgId: string): Promise<Partial<BusinessCalendar>> => {
+      if (!calendars.has(orgId)) {
+        const org = await this.prisma.organization.findUnique({ where: { id: orgId }, select: { settings: true } });
+        calendars.set(orgId, ((org?.settings as any)?.calendar as Partial<BusinessCalendar>) ?? {});
+      }
+      return calendars.get(orgId)!;
+    };
+
+    /** A threshold fires at most once per case — the notification ledger is
+     *  the durable marker, so restarts and duplicate sweeps stay quiet. */
+    const alreadyFired = async (caseId: string, eventKey: string, thresholdLabel: string) => {
+      const rows = await this.prisma.notification.findMany({
+        where: { templateCode: eventKey, resourceId: caseId },
+        select: { payload: true },
+        take: 200,
+      });
+      return rows.some((n) => (n.payload as any)?.variables?.threshold === thresholdLabel);
+    };
 
     const fired: string[] = [];
     const escalated: string[] = [];
+
     for (const c of candidates) {
       if (c.slaPausedAt) continue; // paused: thresholds do not fire
-      const totalMs = c.slaDueAt!.getTime() - c.submittedAt!.getTime() - Number(c.slaPausedMs);
-      const elapsedMs = now.getTime() - c.submittedAt!.getTime() - Number(c.slaPausedMs);
-      const ratio = totalMs > 0 ? elapsedMs / totalMs : 1;
 
-      if (ratio >= 1) {
-        if (c.slaDueAt! >= now) continue;
-        // Breached: transition to ESCALATED once, priority raised one step.
-        // escalationFiredAt only gates the earlier 80% warning — a breached
-        // case must still escalate even if it was warned.
+      const cal = await calendarFor(c.organizationId);
+      const pausedMs = Number(c.slaPausedMs);
+      const workingTotal = Math.max(1, workingMsBetween(c.submittedAt!, c.slaDueAt!, cal) - pausedMs);
+      const workingElapsed = Math.max(0, workingMsBetween(c.submittedAt!, now, cal) - pausedMs);
+      const wallTotal = c.slaDueAt!.getTime() - c.submittedAt!.getTime() - pausedMs;
+      const wallElapsed = now.getTime() - c.submittedAt!.getTime() - pausedMs;
+      const workingRatio = workingElapsed / workingTotal;
+      const wallRatio = wallTotal > 0 ? wallElapsed / wallTotal : 1;
+
+      // ---- breach path: the real due instant has passed ----
+      if (c.slaDueAt! < now) {
         if (c.status !== 'ESCALATED') {
           await this.prisma.$transaction([
             this.prisma.case.update({
@@ -428,15 +494,49 @@ export class WorkflowService {
             });
           }
         }
-      } else if (ratio >= 0.8 && !c.escalationFiredAt) {
-        // 80% threshold: warn owner and manager once, never repeatedly.
-        if (c.ownerUserId) {
+        continue;
+      }
+
+      // ---- configured warning thresholds (working-time, wall-clock union) ----
+      for (const [pct, rule] of thresholdsFor(c.caseType?.id)) {
+        const hit = workingRatio >= pct / 100 || wallRatio >= pct / 100;
+        if (!hit) break;
+        const eventKey = pct === 80 ? 'CASE_AT_RISK_80' : `CASE_AT_RISK_${pct}`;
+        if (await alreadyFired(c.id, eventKey, String(pct))) continue;
+
+        const action = rule.action ?? 'NOTIFY_OWNER_AND_MANAGER';
+        const managerIds = (
+          await this.prisma.membership.findMany({
+            where: { organizationId: c.organizationId, role: { code: 'Manager' }, user: { status: 'ACTIVE' }, deletedAt: null },
+            select: { userId: true },
+          })
+        ).map((r) => r.userId);
+
+        const recipients = new Set<string>();
+        if (action.startsWith('REASSIGN') && rule.targetRoleId) {
+          const candidate = await this.prisma.membership.findFirst({
+            where: { organizationId: c.organizationId, roleId: rule.targetRoleId, user: { status: 'ACTIVE' }, deletedAt: null },
+            select: { userId: true },
+            orderBy: { createdAt: 'asc' },
+          });
+          if (candidate && candidate.userId !== c.ownerUserId) {
+            recipients.add(candidate.userId);
+            if (c.ownerUserId) recipients.add(c.ownerUserId);
+            await this.prisma.case.update({ where: { id: c.id }, data: { ownerUserId: candidate.userId } });
+          }
+        }
+        if (recipients.size === 0) {
+          if (c.ownerUserId) recipients.add(c.ownerUserId);
+          for (const m of managerIds) recipients.add(m);
+        }
+
+        for (const recipientId of recipients) {
           await this.notifications.notify({
-            recipientId: c.ownerUserId,
+            recipientId,
             organizationId: c.organizationId,
-            eventKey: 'CASE_AT_RISK_80',
+            eventKey,
             urgent: false,
-            variables: { reference: c.reference },
+            variables: { reference: c.reference, threshold: String(pct), action },
             resourceType: 'case',
             resourceId: c.id,
           });
@@ -444,7 +544,93 @@ export class WorkflowService {
         await this.prisma.case.update({ where: { id: c.id }, data: { escalationFiredAt: now } });
         fired.push(c.id);
       }
+
+      // ---- inactivity rule (FR-4.6): untouched case for N hours ----
+      for (const hours of noActivityHours) {
+        const staleMs = now.getTime() - c.updatedAt.getTime();
+        if (staleMs < hours * 3600 * 1000) continue;
+        if (await alreadyFired(c.id, 'CASE_NO_ACTIVITY', String(hours))) continue;
+        if (c.ownerUserId) {
+          await this.notifications.notify({
+            recipientId: c.ownerUserId,
+            organizationId: c.organizationId,
+            eventKey: 'CASE_NO_ACTIVITY',
+            urgent: false,
+            variables: { reference: c.reference, threshold: String(hours), hoursInactive: hours },
+            resourceType: 'case',
+            resourceId: c.id,
+          });
+        }
+        fired.push(c.id);
+      }
     }
     return { sweptAt: now.toISOString(), notified: fired.length, notifiedCases: fired, escalatedReferences: escalated };
+  }
+
+  /**
+   * FR-4.7: reminder sweep — notifies a task's assignee before the due date.
+   * Thresholds (hours before due) default to [24, 1] and are configurable per
+   * organisation via Organization.settings.taskReminderHours. Idempotent: each
+   * task × threshold combination fires at most once, ever.
+   */
+  async runReminders(ctx: UserContext) {
+    this.requirePermission(ctx, 'task.read');
+    const org = await this.prisma.organization.findUnique({
+      where: { id: ctx.organizationId! },
+      select: { settings: true },
+    });
+    const configured = (org?.settings as any)?.taskReminderHours;
+    const thresholds: number[] =
+      Array.isArray(configured) &&
+      configured.length > 0 &&
+      configured.every((n: any) => typeof n === 'number')
+        ? configured
+        : [24, 1];
+
+    const now = Date.now();
+    const tasks = await this.prisma.task.findMany({
+      where: {
+        organizationId: ctx.organizationId!,
+        status: { in: ['OPEN', 'IN_PROGRESS', 'BLOCKED'] },
+        dueAt: { not: null },
+        assigneeUserId: { not: null },
+      },
+      include: { case: { select: { reference: true } } },
+    });
+
+    const sent: Array<{ taskId: string; hoursBefore: number }> = [];
+    for (const task of tasks) {
+      const dueAtMs = task.dueAt!.getTime();
+      if (dueAtMs <= now) continue; // already overdue — the escalation sweep owns that path
+      for (const hours of thresholds) {
+        if (dueAtMs - now > hours * 3600 * 1000) continue;
+        const existing = await this.prisma.notification.findFirst({
+          where: {
+            recipientId: task.assigneeUserId!,
+            templateCode: 'TASK_DUE_REMINDER',
+            resourceId: task.id,
+            payload: { path: ['thresholdHours'], equals: hours },
+          },
+        });
+        if (existing) continue;
+        await this.notifications.notify({
+          recipientId: task.assigneeUserId!,
+          organizationId: task.organizationId,
+          eventKey: 'TASK_DUE_REMINDER',
+          urgent: hours <= 1,
+          resourceType: 'task',
+          resourceId: task.id,
+          variables: {
+            taskTitle: task.title,
+            caseRef: task.case?.reference ?? 'general',
+            dueAt: task.dueAt!.toISOString().slice(0, 16).replace('T', ' '),
+            hoursLeft: String(hours),
+          },
+          payloadExtras: { thresholdHours: hours },
+        });
+        sent.push({ taskId: task.id, hoursBefore: hours });
+      }
+    }
+    return { sweptAt: new Date(now).toISOString(), thresholds, checked: tasks.length, remindersSent: sent };
   }
 }

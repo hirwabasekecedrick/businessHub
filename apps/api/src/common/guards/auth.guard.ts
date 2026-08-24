@@ -3,6 +3,7 @@ import {
   ExecutionContext,
   ForbiddenException,
   Injectable,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
@@ -66,6 +67,20 @@ export class AuthGuard implements CanActivate {
       throw new UnauthorizedException({ code: 'AUTH_REQUIRED' });
     }
 
+    // FR-1.4 / FR-1.9: a revoked session is dead on the next request, not
+    // just at refresh time. Tokens without sid (impersonation, dev header)
+    // are unaffected.
+    const sid = typeof request.jwt?.sid === 'string' ? request.jwt.sid : null;
+    if (sid) {
+      const session = await this.prisma.session.findUnique({
+        where: { id: sid },
+        select: { revokedAt: true },
+      });
+      if (!session || session.revokedAt) {
+        throw new UnauthorizedException({ code: 'SESSION_REVOKED' });
+      }
+    }
+
     const requestedOrg = request.headers['x-organization-id'];
     let membership = user.memberships.find((m) => m.organizationId === requestedOrg);
     if (requestedOrg && !membership) {
@@ -97,11 +112,43 @@ export class AuthGuard implements CanActivate {
       })),
     };
     request.context = ctx;
+    await this.checkMaintenance(ctx);
     return true;
+  }
+
+  /** FR-9.5: global maintenance mode; settings staff keep access to restore. */
+  private static maintenanceCache: { value: { enabled: boolean; message: string | null }; at: number } | null = null;
+
+  private async checkMaintenance(ctx: UserContext): Promise<void> {
+    const cached = AuthGuard.maintenanceCache;
+    let value = cached?.value;
+    if (!cached || !value || Date.now() - cached.at > 5000) {
+      const org = await this.prisma.organization.findFirst({
+        where: { type: 'INTERNAL' },
+        select: { settings: true },
+      });
+      const m = ((org?.settings as Record<string, any>) ?? {}).maintenance ?? {};
+      value = { enabled: m.enabled === true, message: m.message ?? null };
+      AuthGuard.maintenanceCache = { value, at: Date.now() };
+    }
+    if (
+      value.enabled &&
+      !ctx.permissions?.includes('*') &&
+      !ctx.permissions?.includes('org.settings.manage')
+    ) {
+      throw new ServiceUnavailableException({
+        code: 'MAINTENANCE_MODE',
+        message: value.message ?? 'The portal is under maintenance — back shortly.',
+      });
+    }
   }
 
   private extractTokenFromHeader(request: any): string | undefined {
     const [type, token] = request.headers.authorization?.split(' ') ?? [];
-    return type === 'Bearer' ? token : undefined;
+    if (type === 'Bearer' && token) return token;
+    // EventSource cannot set headers — allow ?token= for SSE endpoints.
+    return typeof request.query?.token === 'string' && request.query.token
+      ? request.query.token
+      : undefined;
   }
 }

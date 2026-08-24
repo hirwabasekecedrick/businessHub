@@ -1,5 +1,4 @@
-import { Module } from '@nestjs/common';
-import { APP_GUARD } from '@nestjs/core';
+import { Module } from '@nestjs/common';import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { CasesModule } from './modules/cases/cases.module';
@@ -12,8 +11,10 @@ import { FinanceModule } from './modules/finance/finance.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { PublicModule } from './modules/public/public.controller';
 import { AuthGuard } from './common/guards/auth.guard';
 import { PrismaModule } from './common/prisma.service';
+import { SanitizeDenialFilter } from './common/sanitize-denial.filter';
 import { CommonModule } from './common/common.module';
 
 @Module({
@@ -30,6 +31,7 @@ import { CommonModule } from './common/common.module';
     NotificationsModule,
     ReportsModule,
     AdminModule,
+    PublicModule,
   ],
   controllers: [AppController],
   providers: [
@@ -38,6 +40,13 @@ import { CommonModule } from './common/common.module';
       provide: APP_GUARD,
       useClass: AuthGuard,
     },
+    {
+      provide: APP_FILTER,
+      useClass: SanitizeDenialFilter,
+    },
   ],
 })
 export class AppModule {}
+
+
+

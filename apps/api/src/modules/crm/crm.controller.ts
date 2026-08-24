@@ -81,4 +81,17 @@ export class CrmController {
   async exportCrm(@CurrentUser() ctx: UserContext) {
     return this.crmService.exportCrm(ctx);
   }
+
+  /** FR-2.7: cross-module full-text search (?q=&limit=). */
+  @Get('search')
+  async search(@CurrentUser() ctx: UserContext, @Query('q') q?: string, @Query('limit') limit?: string) {
+    return this.crmService.search(ctx, q ?? '', limit ? Number(limit) : undefined);
+  }
+
+  /** US-2.3: idempotent compliance sweep (expiring docs, AT_RISK, recovery). */
+  @Post('crm/compliance/sweep')
+  @HttpCode(200)
+  async sweepCompliance(@CurrentUser() ctx: UserContext) {
+    return this.crmService.sweepCompliance(ctx);
+  }
 }

@@ -26,8 +26,32 @@ export class IdentityController {
   @Public()
   @Post('verify-email')
   @HttpCode(200)
-  async verifyEmail(@Body() body: { token: string }) {
-    return this.identityService.verifyEmail(body.token);
+  async verifyEmail(@Body() body: { token: string }, @Req() req: any) {
+    return this.identityService.verifyEmail(body.token, req.ip, req.headers['user-agent']);
+  }
+
+  /** US-1.1: unverified users can request a fresh verification email from the sign-in error state. */
+  @Public()
+  @Post('resend-verification')
+  @HttpCode(200)
+  async resendVerification(@Body() body: { email: string }) {
+    return this.identityService.resendVerification(body.email);
+  }
+
+  /** FR-1.4: forgotten password — step 1 issues the single-use link, step 2 applies the new password. */
+  @Public()
+  @Post('password/forgot')
+  @HttpCode(200)
+  async forgotPassword(@Body() body: { email: string }) {
+    return this.identityService.forgotPassword(body.email);
+  }
+
+  /** FR-1.4: applying the new password revokes every existing session. */
+  @Public()
+  @Post('password/reset')
+  @HttpCode(200)
+  async resetPassword(@Body() body: { token: string; password: string }, @Req() req: any) {
+    return this.identityService.resetPassword(body.token, body.password, req.ip, req.headers['user-agent']);
   }
 
   @Public()
@@ -57,6 +81,30 @@ export class IdentityController {
     );
   }
 
+  /** US-1.2 forced enrolment (sign-in challenge, not yet authenticated). */
+  @Public()
+  @Post('mfa/enrol/challenge')
+  @HttpCode(200)
+  async enrolForChallenge(@Body() body: { challengeId: string }) {
+    return this.identityService.enrolForChallenge(body.challengeId);
+  }
+
+  /** Completes forced enrolment and returns the first real session. */
+  @Public()
+  @Post('mfa/confirm/challenge')
+  @HttpCode(200)
+  async confirmEnrolmentForChallenge(
+    @Body() body: { challengeId: string; code: string },
+    @Req() req: any,
+  ) {
+    return this.identityService.confirmEnrolmentForChallenge(
+      body.challengeId,
+      body.code,
+      req.ip,
+      req.headers['user-agent'],
+    );
+  }
+
   @Public()
   @Post('refresh')
   @HttpCode(200)
@@ -81,20 +129,6 @@ export class IdentityController {
       req.ip,
       req.headers['user-agent'],
     );
-  }
-
-  @Public()
-  @Post('password/forgot')
-  @HttpCode(200)
-  async forgotPassword(@Body() body: { email: string }) {
-    return this.identityService.forgotPassword(body.email);
-  }
-
-  @Public()
-  @Post('password/reset')
-  @HttpCode(200)
-  async resetPassword(@Body() body: { token: string; password: string }) {
-    return this.identityService.resetPassword(body.token, body.password);
   }
 
   @Get('me')

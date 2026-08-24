@@ -1,9 +1,9 @@
-"use client";
+﻿"use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { CheckCircle2, Loader2, ShieldCheck } from "lucide-react";
+import { CheckCircle2, CircleDashed, Loader2, ShieldCheck, XCircle } from "lucide-react";
 
 import { isApiError, useAuth } from "@/components/providers/auth-provider";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -18,7 +18,27 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-type Phase = "form" | "verify" | "done";
+type Phase = "form" | "verify" | "verifying" | "done";
+
+/** Mirrors the backend rule exactly: password_min_length_12. */
+const MIN_PASSWORD_LENGTH = 12;
+
+function PasswordRule({ ok, label }: { ok: boolean; label: string }) {
+  return (
+    <li
+      className={`flex items-center gap-1.5 text-xs ${
+        ok ? "text-emerald-600" : "text-muted-foreground"
+      }`}
+    >
+      {ok ? (
+        <CheckCircle2 className="size-3.5 shrink-0" />
+      ) : (
+        <CircleDashed className="size-3.5 shrink-0" />
+      )}
+      {label}
+    </li>
+  );
+}
 
 export default function RegisterPage() {
   const { status, register, verifyEmail } = useAuth();
@@ -29,14 +49,45 @@ export default function RegisterPage() {
   const [lastName, setLastName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [token, setToken] = useState("");
-  const [devHint, setDevHint] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const autoVerifyRan = useRef(false);
 
-  if (status === "authenticated") {
-    router.replace("/dashboard");
-  }
+  useEffect(() => { if (status === "authenticated") router.replace("/"); }, [status, router]);
+
+  /* Verification emails link here with ?verify=<token>. Verify immediately so
+     clicking the email link completes activation; the raw token also remains
+     usable via the paste box as an alternative path. */
+  useEffect(() => {
+    if (autoVerifyRan.current) return;
+    const q = new URLSearchParams(window.location.search);
+    const v = q.get("verify");
+    if (!v) return;
+    autoVerifyRan.current = true;
+    setToken(v);
+    setPhase("verifying");
+    verifyEmail(v)
+      .then(() => {
+        window.history.replaceState(null, "", "/register");
+        setPhase("done");
+      })
+      .catch(() => {
+        window.history.replaceState(null, "", "/register");
+        setError("That verification link is invalid or expired — you can paste the token below instead.");
+        setPhase("verify");
+      });
+  }, [verifyEmail]);
+
+  const lengthOk = password.length >= MIN_PASSWORD_LENGTH;
+  const matchOk = confirmPassword.length > 0 && password === confirmPassword;
+  const formValid =
+    firstName.trim().length > 0 &&
+    lastName.trim().length > 0 &&
+    /.+@.+\..+/.test(email.trim()) &&
+    lengthOk &&
+    matchOk;
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -44,13 +95,12 @@ export default function RegisterPage() {
     setPending(true);
     try {
       if (phase === "form") {
-        const res = await register(
+        await register(
           firstName.trim(),
           lastName.trim(),
           email.trim(),
           password,
         );
-        if (res.devVerificationToken && !devHint) setDevHint(res.devVerificationToken);
         setPhase("verify");
       } else if (phase === "verify") {
         await verifyEmail(token.trim());
@@ -64,7 +114,7 @@ export default function RegisterPage() {
           setError("An account with this email already exists.");
           break;
         case "VALIDATION_FAILED":
-          setError("Check your details — password must be at least 8 characters.");
+          setError("Password must be at least 12 characters.");
           break;
         case "INVALID_TOKEN":
           setError("That verification code is invalid or expired.");
@@ -81,8 +131,9 @@ export default function RegisterPage() {
     <main className="flex min-h-svh flex-1 items-center justify-center bg-sidebar p-6">
       <div className="w-full max-w-md space-y-6">
         <div className="flex items-center gap-3 text-sidebar-foreground">
-          <div className="flex size-10 items-center justify-center rounded-xl bg-sidebar-primary font-bold text-sidebar-primary-foreground">
-            BH
+          <div className="flex size-10 items-center justify-center rounded-xl bg-white p-1.5 shadow-sm">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/logo_no_bg.png" alt="BusinessHub" className="size-full object-contain" />
           </div>
           <span className="text-lg font-semibold tracking-tight">BusinessHub</span>
         </div>
@@ -140,14 +191,44 @@ export default function RegisterPage() {
                       id="password"
                       type="password"
                       autoComplete="new-password"
-                      placeholder="At least 8 characters"
+                      placeholder={`${MIN_PASSWORD_LENGTH}+ characters`}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      minLength={8}
+                      minLength={MIN_PASSWORD_LENGTH}
                       required
                     />
+                    <ul className="space-y-1 pt-1">
+                      <PasswordRule
+                        ok={lengthOk}
+                        label={`At least ${MIN_PASSWORD_LENGTH} characters (${password.length}/${MIN_PASSWORD_LENGTH})`}
+                      />
+                      <PasswordRule ok={matchOk} label="Passwords match" />
+                    </ul>
                   </div>
-                  <Button type="submit" size="lg" disabled={pending} className="sm:col-span-2 w-full">
+                  <div className="grid gap-2 sm:col-span-2">
+                    <Label htmlFor="confirmPassword">Confirm password</Label>
+                    <Input
+                      id="confirmPassword"
+                      type="password"
+                      autoComplete="new-password"
+                      placeholder="Repeat your password"
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      required
+                    />
+                    {confirmPassword.length > 0 && !matchOk && (
+                      <p className="flex items-center gap-1.5 text-xs text-destructive">
+                        <XCircle className="size-3.5" />
+                        Passwords do not match yet.
+                      </p>
+                    )}
+                  </div>
+                  <Button
+                    type="submit"
+                    size="lg"
+                    disabled={pending || !formValid}
+                    className="w-full sm:col-span-2"
+                  >
                     {pending && <Loader2 className="animate-spin" />}
                     Create account
                   </Button>
@@ -164,7 +245,7 @@ export default function RegisterPage() {
             </>
           )}
 
-          {phase === "verify" && (
+          {(phase === "verify" || phase === "verifying") && (
             <>
               <CardHeader className="gap-1">
                 <CardTitle className="flex items-center gap-2 text-xl font-semibold">
@@ -173,19 +254,10 @@ export default function RegisterPage() {
                 </CardTitle>
                 <CardDescription>
                   We sent a verification link to{" "}
-                  <span className="font-medium text-foreground">{email}</span>. Paste the
-                  token or code below to activate your account.
+                  <span className="font-medium text-foreground">{email || "your inbox"}</span>.
+                  Open it to finish — or paste the code below.
                 </CardDescription>
               </CardHeader>
-              {devHint && (
-                <CardContent className="pb-0">
-                  <Alert>
-                    <AlertDescription className="break-all font-mono text-xs">
-                      Dev mode token: {devHint}
-                    </AlertDescription>
-                  </Alert>
-                </CardContent>
-              )}
               {error && (
                 <CardContent className="pb-0">
                   <Alert variant="destructive">
@@ -200,14 +272,17 @@ export default function RegisterPage() {
                     <Input
                       id="token"
                       autoFocus
+                      disabled={phase === "verifying"}
                       placeholder="Paste the token from your email"
                       value={token}
                       onChange={(e) => setToken(e.target.value)}
                       required
                     />
                   </div>
-                  <Button type="submit" size="lg" disabled={pending} className="w-full">
-                    {pending && <Loader2 className="animate-spin" />}
+                  <Button type="submit" size="lg" disabled={pending || phase === "verifying"} className="w-full">
+                    {pending || phase === "verifying" ? (
+                      <Loader2 className="animate-spin" />
+                    ) : null}
                     Verify email
                   </Button>
                 </CardContent>

@@ -64,3 +64,30 @@ export function computeSlaDueAt(from: Date, slaHours: number, calendar?: Partial
   }
   return cursor;
 }
+
+/**
+ * Working milliseconds elapsed between two instants according to the calendar.
+ * Both ends are clamped to working moments; nights, weekends and holidays
+ * contribute nothing. Returns 0 when `to` is not after `from`.
+ */
+export function workingMsBetween(from: Date, to: Date, calendar?: Partial<BusinessCalendar>): number {
+  if (to.getTime() <= from.getTime()) return 0;
+  const cal = { ...DEFAULT_CALENDAR, ...calendar };
+  let cursor = nextWorkingMoment(new Date(from), cal);
+  const end = new Date(to);
+  let total = 0;
+  let guard = 0;
+  while (cursor < end && guard < 10000) {
+    guard++;
+    const dayEnd = new Date(
+      Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate(), cal.endHour, 0, 0),
+    );
+    const segEnd = dayEnd < end ? dayEnd : end;
+    total += Math.max(0, segEnd.getTime() - cursor.getTime());
+    cursor = nextWorkingMoment(
+      new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth(), cursor.getUTCDate() + 1, cal.startHour, 0, 0)),
+      cal,
+    );
+  }
+  return total;
+}

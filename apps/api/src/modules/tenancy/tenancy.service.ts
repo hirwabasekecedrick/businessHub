@@ -9,6 +9,7 @@ import { UserContext } from '../../common/abilities/case-ability.service';
 import { PrismaService } from '../../common/prisma.service';
 import { AuditService } from '../../common/audit.service';
 import { NotificationService } from '../../common/notification.service';
+import { MailerService } from '../../common/mailer.service';
 import * as argon2 from 'argon2';
 import * as crypto from 'crypto';
 
@@ -18,6 +19,7 @@ export class TenancyService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly notifications: NotificationService,
+    private readonly mailer: MailerService,
   ) {}
 
   private pepper() {
@@ -28,6 +30,17 @@ export class TenancyService {
     if (!ctx.permissions?.includes(permission) && !ctx.permissions?.includes('*')) {
       throw new ForbiddenException({ code: 'PERMISSION_DENIED', required: permission });
     }
+  }
+
+  /* A held permission satisfies a required one when they match, or when the
+     holder carries a broader scope of the same action — org-wide access
+     implies own-scope access, so Admin/Manager can grant Client/Visitor
+     roles without holding the literal `*.own` grants. */
+  private permissionSatisfied(held: Set<string>, needed: string): boolean {
+    if (held.has(needed)) return true;
+    if (!needed.endsWith('.own')) return false;
+    const base = needed.slice(0, -'.own'.length);
+    return held.has(`${base}.org`) || held.has(base);
   }
 
   // ---------- ORGANIZATIONS ----------
@@ -147,6 +160,12 @@ export class TenancyService {
     }));
   }
 
+  /* One-time tokens are echoed in API responses ONLY for local testing and
+   * the acceptance suite. Production must leave EXPOSE_DEV_TOKENS unset. */
+  private devTokensOn(): boolean {
+    return process.env.NODE_ENV !== 'production' && process.env.EXPOSE_DEV_TOKENS === '1';
+  }
+
   async inviteUser(ctx: UserContext, orgId: string, email: string, roleId: string) {
     this.requirePermission(ctx, 'user.invite');
 
@@ -161,7 +180,7 @@ export class TenancyService {
     const myPerms = new Set(myMembership ? [...myMembership.role.permissions] : ctx.permissions);
     if (myMembership && !myPerms.has('*')) {
       for (const p of targetRole.permissions) {
-        if (!myPerms.has(p)) {
+        if (!this.permissionSatisfied(myPerms, p)) {
           await this.audit.record({
             actorUserId: ctx.id,
             organizationId: orgId,
@@ -181,6 +200,19 @@ export class TenancyService {
       throw new ForbiddenException({ code: 'ROLE_ESCALATION_FORBIDDEN' });
     }
 
+    // FR-1.3: Manager/Admin/Super cannot be assigned to a user who has not
+    // enrolled in MFA.
+    const MFA_MANDATORY = ['Manager', 'Admin', 'Super'];
+    if (MFA_MANDATORY.includes(targetRole.code)) {
+      const existing = await this.prisma.user.findUnique({
+        where: { email: email.toLowerCase() },
+        select: { mfaSecret: true, mfaEnabledAt: true },
+      });
+      if (!existing || !existing.mfaSecret || !existing.mfaEnabledAt) {
+        throw new UnprocessableEntityException({ code: 'MFA_ENROLMENT_REQUIRED_FOR_ROLE' });
+      }
+    }
+
     const token = crypto.randomBytes(24).toString('hex');
     const invitation = await this.prisma.invitation.create({
       data: {
@@ -193,7 +225,7 @@ export class TenancyService {
       },
     });
 
-    // Mock email delivery via the notification pipeline.
+    // In-app notification for the inviting user (audit trail of the invite).
     await this.notifications.notify({
       recipientId: ctx.id,
       organizationId: orgId,
@@ -201,13 +233,44 @@ export class TenancyService {
       variables: { email, invitedBy: ctx.email },
     });
 
-    const devMode = (process.env.DEV_HEADER_AUTH ?? 'true') === 'true';
+    // Real invitation email to the invitee.
+    const org = await this.prisma.organization.findUnique({
+      where: { id: orgId },
+      select: { legalName: true },
+    });
+    await this.sendInvitationEmail(
+      email,
+      org?.legalName ?? 'an organization',
+      targetRole.name,
+      token,
+    );
+
+    const devMode = this.devTokensOn();
     return {
       invitationId: invitation.id,
       expiresAt: invitation.expiresAt,
       message: 'Invitation created and email sent',
       ...(devMode ? { devAcceptToken: token } : {}),
     };
+  }
+
+  private async sendInvitationEmail(to: string, orgName: string, roleName: string, token: string) {
+    const frontend = process.env.FRONTEND_URL ?? 'http://localhost:3000';
+    await this.mailer.send({
+      to,
+      subject: `You have been invited to join ${orgName} on BusinessHub`,
+      text: `You have been invited to join ${orgName} as ${roleName}.\n\nAccept with this invitation code in BusinessHub:\n${token}\n\nThe invitation expires in 14 days.`,
+      html: this.mailer.wrap(
+        `Join ${orgName}`,
+        `<p>You have been invited to join <strong>${this.escape(orgName)}</strong> on BusinessHub as <strong>${this.escape(roleName)}</strong>.</p><p>Use this invitation code when accepting:</p><p style="font-family:monospace;background:#f1f5f9;padding:10px 14px;border-radius:6px">${this.escape(token)}</p>`,
+        'Open BusinessHub',
+        frontend,
+      ),
+    });
+  }
+
+  private escape(s: string): string {
+    return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] ?? c);
   }
 
   async acceptInvitation(token: string, password?: string) {
@@ -285,14 +348,23 @@ export class TenancyService {
 
   async resendInvitation(ctx: UserContext, invitationId: string) {
     this.requirePermission(ctx, 'user.invite');
-    const invitation = await this.prisma.invitation.findUnique({ where: { id: invitationId } });
+    const invitation = await this.prisma.invitation.findUnique({
+      where: { id: invitationId },
+      include: { organization: true, role: true },
+    });
     if (!invitation) throw new NotFoundException({ code: 'INVITATION_NOT_FOUND' });
     const token = crypto.randomBytes(24).toString('hex');
     const updated = await this.prisma.invitation.update({
       where: { id: invitationId },
       data: { token, status: 'PENDING', expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) },
     });
-    const devMode = (process.env.DEV_HEADER_AUTH ?? 'true') === 'true';
+    await this.sendInvitationEmail(
+      invitation.email,
+      invitation.organization.legalName,
+      invitation.role.name,
+      token,
+    );
+    const devMode = this.devTokensOn();
     return { message: 'Invitation resent', ...(devMode ? { devAcceptToken: token } : {}), expiresAt: updated.expiresAt };
   }
 
@@ -345,7 +417,7 @@ export class TenancyService {
     if (myMembership && !myMembership.role.permissions.includes('*')) {
       const myPerms = new Set(myMembership.role.permissions);
       for (const p of targetRole.permissions) {
-        if (!myPerms.has(p)) throw new ForbiddenException({ code: 'ROLE_ESCALATION_FORBIDDEN', missingPermission: p });
+        if (!this.permissionSatisfied(myPerms, p)) throw new ForbiddenException({ code: 'ROLE_ESCALATION_FORBIDDEN', missingPermission: p });
       }
     }
 
@@ -420,6 +492,18 @@ export class TenancyService {
       include: { case: true },
     });
 
+    // Capture the orgs while memberships are still live; managers there get the handover notice.
+    const orgIds = [
+      ...new Set(
+        (
+          await this.prisma.membership.findMany({
+            where: { userId: id, deletedAt: null },
+            select: { organizationId: true },
+          })
+        ).map((m) => m.organizationId),
+      ),
+    ];
+
     const result = await this.prisma.$transaction(async (tx) => {
       await tx.user.update({ where: { id }, data: { status: 'DISABLED', deletedAt: new Date() } });
       await tx.session.updateMany({ where: { userId: id, revokedAt: null }, data: { revokedAt: new Date() } });
@@ -441,6 +525,36 @@ export class TenancyService {
       resourceId: id,
       after: { returnedTasksToQueue: result },
     });
+
+    // US-1.5: every manager/admin of each affected org is notified with the returned task list.
+    const taskList = openTasks.map((t) => t.title).slice(0, 8).join(', ');
+    for (const orgId of orgIds) {
+      const managers = await this.prisma.membership.findMany({
+        where: {
+          organizationId: orgId,
+          deletedAt: null,
+          userId: { not: id },
+          role: { code: { in: ['Manager', 'Admin', 'Super'] } },
+        },
+        select: { userId: true },
+      });
+      for (const manager of [...new Map(managers.map((m) => [m.userId, m])).values()]) {
+        await this.notifications.notify({
+          recipientId: manager.userId,
+          organizationId: orgId,
+          eventKey: 'USER_DEACTIVATED',
+          urgent: true,
+          resourceType: 'user',
+          resourceId: id,
+          variables: {
+            user: user.email,
+            tasksReturned: result,
+            taskList: taskList || 'none',
+            deactivatedBy: ctx.email,
+          },
+        });
+      }
+    }
     return {
       message: 'User deactivated; sessions revoked; tasks returned to queue',
       sessionsRevoked: true,

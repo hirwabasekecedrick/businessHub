@@ -136,6 +136,7 @@ model Organization {
   id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   type           OrgType
   status         OrgStatus @default(PENDING)
+  complianceStatus String  @default("COMPLIANT") @map("compliance_status")
   legalName      String    @map("legal_name")
   tradingName    String?   @map("trading_name")
   registrationNo String?   @map("registration_no")
@@ -163,6 +164,7 @@ model Organization {
   owningInvoices Invoice[]      @relation("InvoiceOwningOrg")
   notifications  Notification[]
   auditEvents    AuditEvent[]
+  referenceSets  ReferenceSet[]
   invitations    Invitation[]
   integrations   IntegrationConfig[] @relation("OrgIntegrations")
   jobs           Job[]               @relation("OrgJobs")
@@ -398,7 +400,8 @@ model Comment {
 
 model Task {
   id             String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  caseId         String     @map("case_id") @db.Uuid
+  // Nullable: org-level tasks (e.g. document expiry follow-ups) are not case-bound.
+  caseId         String?    @map("case_id") @db.Uuid
   organizationId String     @map("organization_id") @db.Uuid
   type           String
   title          String
@@ -414,7 +417,7 @@ model Task {
   createdAt      DateTime   @default(now()) @map("created_at") @db.Timestamptz
   updatedAt      DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
-  case         Case       @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  case         Case?      @relation(fields: [caseId], references: [id], onDelete: Cascade)
   assigneeUser User?      @relation("TaskAssigneeUser", fields: [assigneeUserId], references: [id])
   assigneeRole Role?      @relation("TaskAssigneeRole", fields: [assigneeRoleId], references: [id])
   approvals    Approval[]
@@ -528,7 +531,7 @@ model Invoice {
   organizationId String        @map("organization_id") @db.Uuid
   clientOrgId    String        @map("client_org_id") @db.Uuid
   caseId         String        @map("case_id") @db.Uuid
-  number         String        @unique
+  number         String?       @unique
   status         InvoiceStatus @default(DRAFT)
   currency       String        @db.Char(3)
   subtotal       Decimal       @default(0) @db.Decimal(14, 2)
@@ -607,6 +610,8 @@ model Notification {
   status         NotifStatus  @default(QUEUED)
   providerRef    String?      @map("provider_ref")
   error          String?
+  attempts       Int          @default(0)
+  nextRetryAt    DateTime?    @map("next_retry_at") @db.Timestamptz
   sentAt         DateTime?    @map("sent_at") @db.Timestamptz
   readAt         DateTime?    @map("read_at") @db.Timestamptz
   createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz
@@ -676,6 +681,7 @@ model PasswordResetToken {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId    String   @map("user_id") @db.Uuid
   tokenHash String   @map("token_hash")
+  purpose   String   @default("VERIFY_EMAIL")
   usedAt    DateTime? @map("used_at") @db.Timestamptz
   expiresAt DateTime @map("expires_at") @db.Timestamptz
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz
@@ -758,4 +764,18 @@ model IntegrationConfig {
 
   @@unique([code])
   @@map("integration_config")
+}
+
+model ReferenceSet {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  set            String // tax-rates | business-calendars | document-categories | priorities
+  items          Json         @default("[]")
+  updatedById    String?      @map("updated_by") @db.Uuid
+  updatedAt      DateTime     @default(now()) @updatedAt @map("updated_at")
+
+  organization   Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, set])
+  @@map("reference_set")
 }

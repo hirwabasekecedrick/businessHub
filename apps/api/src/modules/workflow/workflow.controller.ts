@@ -8,6 +8,7 @@ import {
   Param,
   Query,
   HttpCode,
+  ForbiddenException,
 } from '@nestjs/common';
 import { WorkflowService } from './workflow.service';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -16,6 +17,12 @@ import type { UserContext } from '../../common/abilities/case-ability.service';
 @Controller('v1')
 export class WorkflowController {
   constructor(private readonly workflowService: WorkflowService) {}
+
+  private requirePermission(ctx: UserContext, permission: string) {
+    if (!ctx.permissions?.includes(permission) && !ctx.permissions?.includes('*')) {
+      throw new ForbiddenException({ code: 'PERMISSION_DENIED', required: permission });
+    }
+  }
 
   // --- TASKS ---
 
@@ -119,6 +126,7 @@ export class WorkflowController {
 
   @Get('escalation-rules')
   async listRules(@CurrentUser() ctx: UserContext) {
+    this.requirePermission(ctx, 'case.read.org');
     return this.workflowService.listEscalationRules(ctx);
   }
 
@@ -137,5 +145,12 @@ export class WorkflowController {
   @HttpCode(200)
   async sweep(@CurrentUser() ctx: UserContext) {
     return this.workflowService.sweep(ctx);
+  }
+
+  /** FR-4.7: idempotent reminder sweep — fires each threshold once per task. */
+  @Post('tasks/reminders/run')
+  @HttpCode(200)
+  async runReminders(@CurrentUser() ctx: UserContext) {
+    return this.workflowService.runReminders(ctx);
   }
 }
