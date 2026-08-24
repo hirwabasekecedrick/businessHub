@@ -1,6 +1,6 @@
 import type { Tokens } from "@/lib/auth-types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:2020/v1";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://businesshub-nkfk.onrender.com/v1";
 
 const TOKENS_KEY = "businesshub.tokens";
 const ORG_KEY = "businesshub.org";
